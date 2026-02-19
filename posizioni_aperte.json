@@ -1,0 +1,18 @@
+{
+    "XXBTZUSD": {
+        "asset": "XXBTZUSD",
+        "direzione": "LONG",
+        "p_entrata": 66319.9,
+        "size": 0.00500333555703822,
+        "sl": 66170.0,
+        "tp": 66368.67,
+        "voto": 7.5,
+        "fase": 0,
+        "funding": 0.0,
+        "pnl_perc": 0.0,
+        "_da_chiudere": false,
+        "data_apertura": "2026-02-19T19:03:57.057865",
+        "max_profitto": 0.0,
+        "asset_real": "XXBTZUSD"
+    }
+}
