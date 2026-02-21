@@ -34,6 +34,38 @@ from rich.panel import Panel
 from rich.layout import Layout
 from rich.text import Text
 
+def sintesi_analisi(analisi_ia, prezzo_real, posizione_aperta):
+    r_mentore = analisi_ia.get('ragionamento_mentore', '')
+    if len(r_mentore) > 200:
+        r_mentore = r_mentore[:197] + '...'
+    return (
+        f"📊 {analisi_ia.get('direzione', '').upper()} | ⭐ {analisi_ia.get('voto', '?')}/10\n"
+        f"💵 {float(prezzo_real):,.2f} | SL: {analisi_ia.get('sl', '?')} | TP: {analisi_ia.get('tp', '?')}\n"
+        f"🧠 Mentore: {r_mentore}\n"
+        f"📍 Fase: {posizione_aperta.get('fase', '?') if posizione_aperta else '?'}"
+    )
+
+def cambio_analisi_significativo(last, attuale, soglia_voto=0.5, soglia_sl_tp=0.01):
+    voto_old = float(last.get('voto', 0))
+    voto_new = float(attuale.get('voto', 0))
+    if abs(voto_old - voto_new) > soglia_voto:
+        return True
+    if last.get('direzione') != attuale.get('direzione'):
+        return True
+    sl_old = float(last.get('sl', 0))
+    sl_new = float(attuale.get('sl', 0))
+    if sl_old > 0 and sl_new > 0 and abs(sl_old - sl_new) / sl_old > soglia_sl_tp:
+        return True
+    tp_old = float(last.get('tp', 0))
+    tp_new = float(attuale.get('tp', 0))
+    if tp_old > 0 and tp_new > 0 and abs(tp_old - tp_new) / tp_old > soglia_sl_tp:
+        return True
+    ment_old = (last.get('ragionamento_mentore') or '')[:100]
+    ment_new = (attuale.get('ragionamento_mentore') or '')[:100]
+    if ment_old != ment_new:
+        return True
+    return False
+
 # --- Setup logging SOLO su file! Nessun print/stream verso console ---
 logger = logging.getLogger("bot_la")
 logger.setLevel(logging.INFO)
@@ -465,7 +497,45 @@ def esegui_ciclo(posizioni_aperte, layout):
         logger.info(f"[DASH] {trading_ticker} | Voto: {voto} | LSTM: {lstm_field}")
         # 8. SCATOLA NERA
         scrivi_scatola_nera(trading_ticker, dati, analisi_ia)
-
+        
+        # Notifica ANALISI COMPLETA solo se cambio significativo di voto, direzione o var SL/TP
+        last_snap = posizioni_aperte.get(trading_ticker, {}).get('last_notified_analisi', {})
+        if not last_snap or cambio_analisi_significativo(last_snap, analisi_ia):
+            try:
+                messaggio = sintesi_analisi(analisi_ia, prezzo_real, posizioni_aperte.get(trading_ticker, {}))
+                alerts.invia_telegram(messaggio) # <-- Cambia col tuo metodo breve se vuoi!
+                posizioni_aperte.setdefault(trading_ticker, {})['last_notified_analisi'] = {
+                    'voto': float(analisi_ia.get('voto', 0)),
+                    'direzione': analisi_ia.get('direzione'),
+                    'sl': float(analisi_ia.get('sl', 0)),
+                    'tp': float(analisi_ia.get('tp', 0)),
+                    'ragionamento_mentore': (analisi_ia.get('ragionamento_mentore') or '')[:100]
+                }
+            except Exception:
+                logger.exception('Errore notifica analisi su Telegram')
+        
+        if voto is not None and voto >= SOGLIA_VOTO_ENTRY and prezzo_real is not None and prezzo_real > 0:
+            try:
+                alerts.analisi_completa(
+                    asset=trading_ticker,
+                    voto=voto,
+                    direzione=analisi_ia.get('direzione', 'FLAT'),
+                    prezzo_real=prezzo_real,
+                    sentiment=sentiment,
+                    dxy=macro_status["dxy"],
+                    nasdaq=macro_status["nasdaq"],
+                    contesto=contesto,
+                    dati=dati,
+                    mtf=mtf,
+                    lstm_pred=analisi_ia.get('lstm_predizione'),
+                    r_mentore=analisi_ia.get('ragionamento_mentore', ''),
+                    a_logica=analisi_ia.get('logica', {}),
+                    sl_sugg=analisi_ia.get('sl'),
+                    tp_sugg=analisi_ia.get('tp'),
+                    posizione_aperta=posizioni_aperte.get(trading_ticker),
+                )
+            except Exception:
+                logger.exception('Errore notifica analisi su Telegram')
         # --- PATCH: Moon Phase ---
         if trading_ticker in posizioni_aperte:
             pos = posizioni_aperte[trading_ticker]
@@ -480,6 +550,8 @@ def esegui_ciclo(posizioni_aperte, layout):
             
             if trading_ticker in azioni and any(x in azioni[trading_ticker] for x in ["SL_TOCCATO", "TP_RAGGIUNTO"]):
                 posizioni_aperte[trading_ticker]['_da_chiudere'] = True
+                motivo = [x for x in azioni[trading_ticker] if x in ["SL_TOCCATO", "TP_RAGGIUNTO"]][0]
+                posizioni_aperte[trading_ticker]['exit_reason'] = motivo
             
             entry = estrai_float(pos.get('p_entrata', 0))
             tp = estrai_float(pos.get('tp', 0))
@@ -507,7 +579,7 @@ def esegui_ciclo(posizioni_aperte, layout):
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"<i>Capitale protetto, ora lasciamo correre...</i>"
                         )
-                        alerts.invia_messaggio(msg)
+                        alerts.sl_spostato_breakeven(trading_ticker, entry, diff)
                         logger.info(f"[ANDREA] Notifica Fase 1 inviata per {trading_ticker}")
 
                     # --- FASE 2: 100% PROGRESSIONE (MOON PHASE) ---
@@ -524,7 +596,7 @@ def esegui_ciclo(posizioni_aperte, layout):
                             f"━━━━━━━━━━━━━━━━━━━━━━\n"
                             f"<i>Puntiamo alla Luna! Non si chiude più.</i>"
                         )
-                        alerts.invia_messaggio(msg)
+                        alerts.moon_phase_attivata(trading_ticker, diff, p_att)
                         logger.info(f"[ANDREA] Notifica Fase 2 inviata per {trading_ticker}")
 
                 except ZeroDivisionError:
@@ -580,11 +652,22 @@ def esegui_ciclo(posizioni_aperte, layout):
         da_rimuovere = [k for k, v in posizioni_aperte.items() if v.get('_da_chiudere')]
         for a in da_rimuovere:
             logger.info(f"🧹 Cleanup posizione chiusa: {a}")
+            # QUI INSERISCI IL TUO BLOCCO PATCH NOTIFICA TELEGRAM
+            exit_reason = posizioni_aperte[a].get('exit_reason', None)
+            sl = posizioni_aperte[a].get('sl')
+            tp = posizioni_aperte[a].get('tp')
+            pnl_perc = posizioni_aperte[a].get('pnl_perc', 0)
+            pnl_usd = posizioni_aperte[a].get('pnl_usd', 0)
+            asset = a
+            if exit_reason == "SL_TOCCATO":
+                alerts.posizione_chiusa_sl(asset, sl, pnl_perc, pnl_usd)
+            elif exit_reason == "TP_RAGGIUNTO":
+                alerts.posizione_chiusa_tp(asset, tp, pnl_perc, pnl_usd)
+            else:
+                alerts.posizione_chiusa_manager(asset, exit_reason or "CHIUSURA", pnl_perc, pnl_usd)
             del posizioni_aperte[a]
-        
         if da_rimuovere:
             salva_posizioni()
-            
         aggiorna_interfaccia(layout, posizioni_aperte)
     except Exception:
         logger.exception("Errore cleanup ciclo")
