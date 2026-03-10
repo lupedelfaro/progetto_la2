@@ -1,954 +1,1324 @@
 # -*- coding: utf-8 -*-
-# brain_la.py - BRAIN CON CACHE INTELLIGENTE
-
-import time
-import json
-import logging
-import re
-from google import genai
-from config_auto_apprendimento import (
-    GEMINI_MODEL, GEMINI_RETRIES, GEMINI_RETRY_DELAY, GEMINI_REQUEST_DELAY, VOTO_MIN_DEFAULT, VOTO_MAX_DEFAULT
-)
-from lstm_predictor_lite import LSTMPredictor
-from asset_list import ASSET_MAPPING  
-class BrainLA:
-    def __init__(self, api_key=None, feedback_engine=None):
-        import os, logging
-        try:
-            # Prova a importare config_la (se esiste) per ottenere eventuali chiavi o client già predisposti
-            try:
-                import config_la
-            except Exception:
-                config_la = None
-
-            # Priorità per la chiave API:
-            # 1) argomento esplicito api_key
-            # 2) config_la.GEMINI_KEY o config_la.GOOGLE_API_KEY (se config_la importabile)
-            # 3) variabili d'ambiente BRAIN_API_KEY, GOOGLE_API_KEY, GEMINI_KEY
-            self.api_key = (
-                api_key
-                or (getattr(config_la, "GEMINI_KEY", None) if config_la is not None else None)
-                or (getattr(config_la, "GOOGLE_API_KEY", None) if config_la is not None else None)
-                or os.environ.get("BRAIN_API_KEY")
-                or os.environ.get("GOOGLE_API_KEY")
-                or os.environ.get("GEMINI_KEY")
-                or ""
-            )
-
-            # Se in config_la è definito un client pronto (es. config_la.client), usalo
-            self.client = getattr(config_la, "client", None) if config_la is not None else None
-
-            # Valori di configurazione esistenti (presumo definiti come costanti globali)
-            self.model_name = globals().get("GEMINI_MODEL", None)
-            self.tentativi_gemini = globals().get("GEMINI_RETRIES", 1)
-            self.delay_retry = globals().get("GEMINI_RETRY_DELAY", 1)
-            self.request_delay = globals().get("GEMINI_REQUEST_DELAY", 0)
-            self.ultimo_request_time = 0
-            self.feedback_engine = feedback_engine
-            self.cache_analisi = {}
-            self.cache_timeout = 300
-
-            # Caricamento LSTM predictor (se disponibile)
-            try:
-                self.lstm_predictor = LSTMPredictor()
-                logging.info("✅ LSTM Predictor caricato")
-            except Exception as ex:
-                logging.error(f"❌ Errore LSTM Predictor: {ex}")
-                import traceback; traceback.print_exc()
-                self.lstm_predictor = None
-
-            logging.info(f"✅ BrainLA inizializzato con modello {self.model_name}")
-            logging.info(f"✅ Cache sistema attivo (timeout: {self.cache_timeout}s)")
-        except Exception as e:
-            logging.error(f"❌ Errore inizializzazione Brain: {e}")
-            import traceback; traceback.print_exc()
-            # fallback sicuro per evitare crash a livello di creazione dell'istanza
-            self.client = None
-            self.api_key = api_key or ""
-            self.model_name = None
-            self.tentativi_gemini = 1
-            self.delay_retry = 1
-            self.request_delay = 0
-            self.ultimo_request_time = 0
-            self.feedback_engine = feedback_engine
-            self.cache_analisi = {}
-            self.cache_timeout = 300
-            self.lstm_predictor = None
-
-    def genera_analisi_ia(self, prompt, api_key):
-        """
-        Funzione resiliente per chiamare il client GenAI.
-        Prova metodi top-level e metodi annidati (es. chats.create, models.generate_content, interactions.create).
-        Restituisce testo (o None).
-        """
-        import logging, time, traceback, sys
-
-        print("[DEBUG_CALL] Entra genera_analisi_ia", flush=True)
-        logging.info("[DEBUG_CALL] Entra genera_analisi_ia")
-
-        api_key = api_key or getattr(self, "api_key", None)
-
-        # nomi di method-path semplici e annidati da provare (ordine importante)
-        candidate_method_paths = [
-            # preferenze dirette osservate nel tuo client
-            "chats.create", "interactions.create", "models.generate_content", "models.generate",
-            # top-level (fallback)
-            "generate", "create",
-            # altri path utili
-            "chats.generate", "chats.create_message", "chats.completions.create",
-            "models.predict", "models.create",
-            "interactions.generate", "files.create", "batches.create",
-        ]
-
-        def resolve_attr_path(obj, path):
-            """Risolve 'a.b.c' su obj restituendo l'attributo / metodo o None se assente."""
-            cur = obj
-            for part in path.split("."):
-                if not hasattr(cur, part):
-                    return None
-                cur = getattr(cur, part)
-            return cur
-
-        def try_invoke(callable_obj, model, prompt):
-            """
-            Prova diverse firme possibili su callable_obj fino a ottenere una risposta:
-            - kwargs comuni (model/prompt, model/input, model/messages)
-            - positional (prompt), (model,prompt)
-            - request/dict come single positional o kwarg (varie shape)
-            - payload 'messages' per chats
-            Restituisce la response se una chiamata ha successo, altrimenti rilancia l'ultima eccezione.
-            """
-            import traceback
-            last_exc = None
-
-            if not callable(callable_obj):
-                raise TypeError("Oggetto non callable")
-
-            # payload per chats
-            messages_payload = [{"author": "user", "content": [{"type": "text", "text": prompt}]}]
-
-            # lista di tentativi in ordine (descrizione, lambda che invoca)
-            attempts = [
-                ("kwargs: model+prompt", lambda: callable_obj(model=model, prompt=prompt)),
-                ("kwargs: prompt+model", lambda: callable_obj(prompt=prompt, model=model)),
-                ("kwargs: model+input", lambda: callable_obj(model=model, input=prompt)),
-                ("kwargs: input+model", lambda: callable_obj(input=prompt, model=model)),
-                ("kwargs: model+messages", lambda: callable_obj(model=model, messages=messages_payload)),
-                ("kwargs: messages+model", lambda: callable_obj(messages=messages_payload, model=model)),
-                ("kwargs: messages only", lambda: callable_obj(messages=messages_payload)),
-                ("positional: (prompt,)", lambda: callable_obj(prompt)),
-                ("positional: (model, prompt)", lambda: callable_obj(model, prompt)),
-                ("positional dict: {'model','prompt'}", lambda: callable_obj({"model": model, "prompt": prompt})),
-                ("positional dict: {'model','input'}", lambda: callable_obj({"model": model, "input": prompt})),
-                ("positional dict: {'model','instances':[prompt]}", lambda: callable_obj({"model": model, "instances": [prompt]})),
-                ("request kw: {'model','prompt'}", lambda: callable_obj(request={"model": model, "prompt": prompt})),
-                ("request kw: {'model','input'}", lambda: callable_obj(request={"model": model, "input": prompt})),
-                ("request kw: {'model','messages'}", lambda: callable_obj(request={"model": model, "messages": messages_payload})),
-                ("request kw: {'instances':[prompt]}", lambda: callable_obj(request={"model": model, "instances": [prompt]})),
-                ("kwargs: model+instances", lambda: callable_obj(model=model, instances=[prompt])),
-                ("kwargs: model+content", lambda: callable_obj(model=model, content=prompt)),
-                ("kwargs: request messages+model", lambda: callable_obj(request={"messages": messages_payload, "model": model})),
-            ]
-
-            for desc, fn in attempts:
-                try:
-                    result = fn()
-                    return result
-                except Exception as e:
-                    last_exc = e
-                    # non loggare eccessivamente qui; la funzione chiamante stampa dettagli
-                    continue
-
-            # se siamo qui, tutte le prove sono fallite: rilancia l'ultima eccezione
-            if last_exc:
-                raise last_exc
-            raise RuntimeError("Nessun tentativo di invocazione è stato effettuato")
-
-        try:
-            try:
-                import google.genai as genai
-            except Exception as ex:
-                logging.warning(f"[DEBUG_CALL] Impossibile importare google.genai: {ex}")
-                genai = None
-
-            for client_source, client_obj in (("self.client", getattr(self, "client", None)),
-                                              ("genai.Client", None)):
-                if client_source == "self.client" and client_obj:
-                    client = client_obj
-                    logging.info("[DEBUG_CALL] Provo self.client")
-                    print(f"[DEBUG_CALL] Usando client da self.client: {repr(client)}", flush=True)
-                elif client_source == "genai.Client" and genai is not None and hasattr(genai, "Client"):
-                    try:
-                        logging.info("[DEBUG_CALL] Provo genai.Client")
-                        client = genai.Client(api_key=api_key)
-                        print(f"[DEBUG_CALL] Creato genai.Client con api_key presente: {'YES' if api_key else 'NO'}", flush=True)
-                    except Exception as e:
-                        logging.warning(f"[DEBUG_CALL] Creazione genai.Client fallita: {e}")
-                        print(f"[DEBUG_CALL] Creazione genai.Client fallita: {e}", flush=True)
-                        continue
-                else:
-                    continue
-
-                # stampa attributi pubblici client e di sotto-oggetti utili (per debug)
-                try:
-                    public_attrs = [a for a in dir(client) if not a.startswith("_")]
-                    print(f"[DEBUG_CALL] Attributi pubblici client (prime 60): {public_attrs[:60]}", flush=True)
-                    for sub in ("chats", "models", "interactions", "files"):
-                        sub_obj = getattr(client, sub, None)
-                        if sub_obj is not None:
-                            try:
-                                sub_attrs = [a for a in dir(sub_obj) if not a.startswith("_")]
-                                print(f"[DEBUG_CALL] Attributi pubblici client.{sub} (prime 60): {sub_attrs[:60]}", flush=True)
-                            except Exception:
-                                pass
-                except Exception as e:
-                    print(f"[DEBUG_CALL] Errore listing client attrs: {e}", flush=True)
-                # --- Inserire QUI: tentativi mirati per Google GenAI (interactions/chats) ---
-                _interactions = getattr(client, "interactions", None)
-                if _interactions is not None and hasattr(_interactions, "create"):
-                    try:
-                        resp = _interactions.create(input=prompt, model=getattr(self, "model_name", None) or "gemini-2.5-flash")
-                        print(f"[DEBUG_GEMINI_RAW] interactions.create resp={repr(resp)}", flush=True)
-                        try:
-                            response_text = self._estrai_testo_da_response(resp)
-                        except Exception as e:
-                            response_text = None
-                            print(f"[DEBUG_CALL] Errore estrazione testo interactions: {e}", flush=True)
-                        print(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}", flush=True)
-                        if response_text:
-                            return response_text
-                    except Exception as e:
-                        print(f"[DEBUG_CALL] interactions.create ha sollevato: {e}", flush=True)
-
-                # Fallback: client.chats.create(model=..., history=[...]) — usa history, non messages
-                _chats = getattr(client, "chats", None)
-                if _chats is not None and hasattr(_chats, "create"):
-                    try:
-                        history = [{"type": "text", "text": prompt}]
-                        resp = _chats.create(model=getattr(self, "model_name", None) or "gemini-2.5-flash", history=history)
-                        print(f"[DEBUG_GEMINI_RAW] chats.create resp={repr(resp)}", flush=True)
-                        try:
-                            response_text = self._estrai_testo_da_response(resp)
-                        except Exception as e:
-                            response_text = None
-                            print(f"[DEBUG_CALL] Errore estrazione testo chats: {e}", flush=True)
-                        print(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}", flush=True)
-                        if response_text:
-                            return response_text
-                    except Exception as e:
-                        print(f"[DEBUG_CALL] chats.create ha sollevato: {e}", flush=True)
-                # --- Fine blocco mirato ---
-                
-                # tenta tutti i method-path candidati
-                for path in candidate_method_paths:
-                    target = resolve_attr_path(client, path)
-                    present = target is not None
-                    logging.info(f"[DEBUG_CALL] Provo path '{path}' (presente={present}) sul client {client_source}")
-                    print(f"[DEBUG_CALL] Provo path '{path}' (presente={present}) sul client {client_source}", flush=True)
-                    if not present:
-                        continue
-
-                    # se target non è callable, esploriamo metodi comuni all'interno del sub-object
-                    if not callable(target):
-                        for subname in ("create", "generate", "predict", "create_message", "completions", "completion"):
-                            sub_target = resolve_attr_path(target, subname)
-                            if sub_target is None:
-                                continue
-                            if not callable(sub_target):
-                                # es. target.completions.create -> proviamo deep .create/.generate
-                                for deep in ("create", "generate"):
-                                    deep_target = resolve_attr_path(sub_target, deep)
-                                    if deep_target and callable(deep_target):
-                                        try:
-                                            resp = try_invoke(deep_target, getattr(self, "model_name", None), prompt)
-                                        except Exception as e:
-                                            print(f"[DEBUG_CALL] Errore invoking {path}.{subname}.{deep}: {e}", flush=True)
-                                            continue
-                                        logging.info(f"[DEBUG_GEMINI_RAW] path={path}.{subname}.{deep} resp={repr(resp)}")
-                                        print(f"[DEBUG_GEMINI_RAW] path={path}.{subname}.{deep} resp={repr(resp)}", flush=True)
-                                        try:
-                                            response_text = self._estrai_testo_da_response(resp)
-                                        except Exception as e:
-                                            response_text = None
-                                            print(f"[DEBUG_CALL] Errore estrazione testo: {e}", flush=True)
-                                        print(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}", flush=True)
-                                        return response_text
-                                continue
-                            # sub_target è callable: prova direttamente
-                            try:
-                                resp = try_invoke(sub_target, getattr(self, "model_name", None), prompt)
-                            except Exception as e:
-                                print(f"[DEBUG_CALL] Errore invoking {path}.{subname}: {e}", flush=True)
-                                continue
-                            logging.info(f"[DEBUG_GEMINI_RAW] path={path}.{subname} resp={repr(resp)}")
-                            print(f"[DEBUG_GEMINI_RAW] path={path}.{subname} resp={repr(resp)}", flush=True)
-                            try:
-                                response_text = self._estrai_testo_da_response(resp)
-                            except Exception as e:
-                                response_text = None
-                                print(f"[DEBUG_CALL] Errore estrazione testo: {e}", flush=True)
-                            print(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}", flush=True)
-                            return response_text
-
-                    else:
-                        # target è callable: invoca direttamente
-                        try:
-                            resp = try_invoke(target, getattr(self, "model_name", None), prompt)
-                        except Exception as e:
-                            print(f"[DEBUG_CALL] Metodo {path} ha sollevato: {e}", flush=True)
-                            print(traceback.format_exc(limit=2), flush=True)
-                            continue
-
-                        logging.info(f"[DEBUG_GEMINI_RAW] path={path} resp={repr(resp)}")
-                        print(f"[DEBUG_GEMINI_RAW] path={path} resp={repr(resp)}", flush=True)
-                        try:
-                            response_text = self._estrai_testo_da_response(resp)
-                        except Exception as e:
-                            response_text = None
-                            print(f"[DEBUG_CALL] Errore estrazione testo: {e}", flush=True)
-                        print(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}", flush=True)
-                        return response_text
-
-            logging.error("[DEBUG_CALL] Nessuna interfaccia GenAI utilizzabile trovata")
-            return None
-
-        except Exception as e:
-            logging.exception(f"[DEBUG_GEMINI_EXCEPTION] Errore nella chiamata IA: {e}")
-            print(f"[DEBUG_CALL] Errore nella chiamata IA: {e}", flush=True)
-            traceback.print_exc(file=sys.stdout)
-            return None
-
-    # ===== NUOVO: METODI CACHE =====
-    def _pulisci_cache_vecchia(self):
-        now = time.time()
-        keys_to_remove = [symbol for symbol, cached in self.cache_analisi.items()
-                          if now - cached['timestamp'] > self.cache_timeout]
-        for key in keys_to_remove:
-            del self.cache_analisi[key]
-            logging.debug(f"🗑️ Cache scaduta rimossa: {key}")
-
-    def _usa_cache_se_valida(self, symbol):
-        self._pulisci_cache_vecchia()
-        if symbol in self.cache_analisi:
-            cached = self.cache_analisi[symbol]
-            age = time.time() - cached['timestamp']
-            if age < self.cache_timeout:
-                logging.info(f"📦 CACHE HIT per {symbol} (età: {age:.0f}s)")
-                return cached['analisi']
-        return None
-
-    def _salva_in_cache(self, symbol, analisi):
-        self.cache_analisi[symbol] = {
-            'timestamp': time.time(),
-            'analisi': analisi.copy()
-        }
-        logging.debug(f"💾 Salvato in cache: {symbol}")
-
-    def _applica_rate_limiting(self):
-        elapsed = time.time() - self.ultimo_request_time
-        if elapsed < self.request_delay:
-            time.sleep(self.request_delay - elapsed)
-        self.ultimo_request_time = time.time()
-
-    def _estrai_testo_da_response(self, response):
-        """
-        Estrae in modo robusto il testo/JSON dalla response dei client GenAI.
-        Restituisce stringa pulita (o None se non trova testo).
-        """
-        import json, re, traceback
-
-        def clean_code_fence(s: str) -> str:
-            # rimuove ```json ... ``` o ``` ... ``` o singoli backticks
-            s = s.strip()
-            # rimuovi iniziali/trailing triple backticks con lang
-            s = re.sub(r'^\s*```(?:json|text)?\s*', '', s, flags=re.I)
-            s = re.sub(r'\s*```\s*$', '', s)
-            # rimuovi singoli backticks
-            s = s.replace("`", "")
-            return s.strip()
-
-        try:
-            if response is None:
-                return None
-
-            # se è già stringa
-            if isinstance(response, str):
-                s = response.strip()
-                return clean_code_fence(s) if s else None
-
-            # primo punto: SDK Interaction/Chat -> outputs
-            try:
-                if hasattr(response, "outputs"):
-                    outs = getattr(response, "outputs")
-                    if isinstance(outs, (list, tuple)) and outs:
-                        for out in outs:
-                            # 1) attributo .text
-                            if hasattr(out, "text"):
-                                try:
-                                    t = getattr(out, "text")
-                                    if isinstance(t, str) and t.strip():
-                                        return clean_code_fence(t)
-                                except Exception:
-                                    pass
-                            # 2) attributo .content (lista o singolo)
-                            if hasattr(out, "content"):
-                                try:
-                                    cont = getattr(out, "content")
-                                    # lista
-                                    if isinstance(cont, (list, tuple)) and cont:
-                                        for itm in cont:
-                                            if isinstance(itm, str) and itm.strip():
-                                                return clean_code_fence(itm)
-                                            if hasattr(itm, "text") and isinstance(getattr(itm, "text"), str) and getattr(itm, "text").strip():
-                                                return clean_code_fence(getattr(itm, "text"))
-                                            if isinstance(itm, dict):
-                                                for k in ("text", "content", "message"):
-                                                    if k in itm and isinstance(it[k], str) and itm[k].strip():
-                                                        return clean_code_fence(it[k])
-                                    # singolo stringa
-                                    if isinstance(cont, str) and cont.strip():
-                                        return clean_code_fence(cont)
-                                    # oggetto con .text
-                                    if hasattr(cont, "text") and isinstance(getattr(cont, "text"), str) and getattr(cont, "text").strip():
-                                        return clean_code_fence(getattr(cont, "text"))
-                                except Exception:
-                                    pass
-                            # 3) altri attributi utili nello stesso out
-                            for attr in ("summary", "output_text", "message", "body", "result"):
-                                if hasattr(out, attr):
-                                    try:
-                                        v = getattr(out, attr)
-                                        if isinstance(v, str) and v.strip():
-                                            return clean_code_fence(v)
-                                    except Exception:
-                                        pass
-                            # 4) se out è dict-like
-                            try:
-                                if isinstance(out, dict):
-                                    for k in ("text", "content", "message"):
-                                        if k in out and isinstance(out[k], str) and out[k].strip():
-                                            return clean_code_fence(out[k])
-                                    if "content" in out and isinstance(out["content"], (list, tuple)):
-                                        for c in out["content"]:
-                                            if isinstance(c, str) and c.strip():
-                                                return clean_code_fence(c)
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-
-            # se è dict-like top-level
-            if isinstance(response, dict):
-                d = response
-                for key in ("output", "outputs", "completion", "completions", "candidates", "choices", "result", "results", "body"):
-                    if key in d and d[key]:
-                        val = d[key]
-                        if isinstance(val, (list, tuple)) and val:
-                            for it in val:
-                                if isinstance(it, str) and it.strip():
-                                    return clean_code_fence(it)
-                                if isinstance(it, dict):
-                                    for sub in ("text", "content", "message"):
-                                        if sub in it and isinstance(it[sub], str) and it[sub].strip():
-                                            return clean_code_fence(it[sub])
-                                    if "content" in it and isinstance(it["content"], (list, tuple)):
-                                        for c in it["content"]:
-                                            if isinstance(c, str) and c.strip():
-                                                return clean_code_fence(c)
-                            try:
-                                return clean_code_fence(json.dumps(val[0], default=str))
-                            except Exception:
-                                return clean_code_fence(str(val[0]))
-                        if isinstance(val, dict):
-                            for sub in ("text", "content", "message"):
-                                if sub in val and isinstance(val[sub], str) and val[sub].strip():
-                                    return clean_code_fence(val[sub])
-                            try:
-                                return clean_code_fence(json.dumps(val, default=str))
-                            except Exception:
-                                return clean_code_fence(str(val))
-                        if isinstance(val, str) and val.strip():
-                            return clean_code_fence(val)
-                # fallback: prima stringa trovata tra valori
-                for v in d.values():
-                    if isinstance(v, str) and v.strip():
-                        return clean_code_fence(v)
-                try:
-                    return clean_code_fence(json.dumps(d, default=str))
-                except Exception:
-                    return clean_code_fence(str(d))
-
-            # altri attributi SDK generici
-            for attr in ("text", "content", "message", "response", "body"):
-                if hasattr(response, attr):
-                    try:
-                        val = getattr(response, attr)
-                        if isinstance(val, str) and val.strip():
-                            return clean_code_fence(val)
-                        if isinstance(val, (list, tuple)) and val:
-                            for itm in val:
-                                if isinstance(itm, str) and itm.strip():
-                                    return clean_code_fence(itm)
-                                if hasattr(itm, "text") and isinstance(getattr(itm, "text"), str) and getattr(itm, "text").strip():
-                                    return clean_code_fence(getattr(itm, "text"))
-                    except Exception:
-                        pass
-
-            # cerca JSON nella repr (es. {"voto": ...})
-            try:
-                rep = repr(response)
-                m = re.search(r'(\{[^{}]*"voto"[^{}]*\})', rep, re.DOTALL)
-                if m:
-                    return clean_code_fence(m.group(1))
-            except Exception:
-                pass
-
-            # fallback: rappresentazione stringa sensata
-            s = str(response)
-            return clean_code_fence(s) if s and s.strip() else None
-
-        except Exception:
-            traceback.print_exc()
-            try:
-                return str(response)
-            except Exception:
-                return None
-
-    def _pulisci_e_valida_json(self, testo_grezzo):
-        try:
-            if not testo_grezzo:
-                logging.warning("[DEBUG_GEMINI] Risposta vuota da Gemini")
-                return None
-            pulito = re.sub(r'```json\s?|```', '', testo_grezzo).strip()
-            start = pulito.find('{')
-            end = pulito.rfind('}') + 1
-            if start == -1 or end == 0:
-                logging.warning("❌ JSON non trovato nella risposta Gemini")
-                return None
-            json_str = pulito[start:end]
-            try:
-                result = json.loads(json_str)
-            except Exception as e:
-                logging.warning(f"[DEBUG_GEMINI] JSON malformato o parse error: {str(e)} | Risposta: {json_str}")
-                return None
-            if not isinstance(result, dict):
-                logging.warning("[DEBUG_GEMINI] Risposta JSON non è dict")
-                return None
-            return result
-        except Exception as e:
-            logging.warning(f"❌ Errore parsing JSON: {e}")
-            return None
-
-    def _ottieni_feedback_storico(self, symbol):
-        try:
-            if not self.feedback_engine:
-                return "Nessun feedback storico disponibile."
-            feedback = self.feedback_engine.genera_feedback_per_ia()
-            return feedback if feedback else "Nessun feedback conclusivo disponibile."
-        except Exception as e:
-            logging.error(f"❌ Errore recupero feedback: {e}")
-            return "Errore recupero feedback storico."
-
-    def _applica_guardrail_logico(self, voto_gemini, guardrail):
-        try:
-            if not guardrail:
-                return voto_gemini, []
-            voto_min = guardrail.get('voto_minimo', VOTO_MIN_DEFAULT)
-            voto_max = guardrail.get('voto_massimo', VOTO_MAX_DEFAULT)
-            ragioni = guardrail.get('ragioni', [])
-            if voto_gemini is None or voto_gemini < 0:
-                voto_gemini = 0
-            elif voto_gemini > 10:
-                voto_gemini = 10
-            voto_corretto = max(voto_min, min(voto_max, voto_gemini))
-            if voto_corretto != voto_gemini:
-                logging.info(f"🛡️ Guardrail applicato: {voto_gemini:.1f} → {voto_corretto:.1f}")
-                for ragione in ragioni:
-                    logging.info(f"   {ragione}")
-            return voto_corretto, ragioni
-        except Exception as e:
-            logging.error(f"❌ Errore applicazione guardrail: {e}")
-            return voto_gemini, []
-
-    def ottieni_predizione_lstm(self, dati_recenti):
-        try:
-            if not self.lstm_predictor or not dati_recenti:
-                return None
-            predizione = self.lstm_predictor.predici(dati_recenti)
-            logging.info(f"🔍 DEBUG LSTM RAW: {predizione}")
-            if predizione and predizione.get('is_valido'):
-                logging.info(f"🔮 LSTM Predizione: {predizione['direzione']} ({predizione['confidence']:.1f}%)")
-                return predizione
-            else:
-                logging.warning("⚠️ Predizione LSTM non valida o non disponibile")
-                return None
-        except Exception as e:
-            logging.error(f"❌ Errore predizione LSTM: {e}")
-            return None
-
-    def valuta_trade(self, voto_gemini, guardrail):
-        voto_corretto, ragioni_applicate = self._applica_guardrail_logico(voto_gemini, guardrail)
-        if voto_corretto < 7:
-            print("Non si apre trade: voto troppo basso!", ragioni_applicate)
-        else:
-            print("Trade permesso!")
-        for r in ragioni_applicate:
-            print("Motivo:", r)
-
-    def analizza_asset(self, dati, macro_data, sentiment_globale, history_feedback_generico, 
-                       contesto_istituzionale=None, posizione_attuale=None, guardrail=None,
-                       dati_storici_lstm=None):
-        logging.info("[DEBUG_BREAK] Entrato in analizza_asset")
-        print("[DEBUG_BREAK] Entrato in analizza_asset")
-
-        if dati and 'symbol' in dati:
-            dati['symbol'] = ASSET_MAPPING.get(dati['symbol'], dati['symbol'])
-        symbol = dati.get('symbol', 'N/A') if dati else 'N/A'
-        print(f"[DEBUG ASSET] symbol after patch: {symbol}")
-
-        default_error = {
-            "voto": 0,
-            "direzione": "FLAT",
-            "orizzonte": "INTRADAY",
-            "modalita": "SPOT",
-            "sl": 0,
-            "tp": 0,
-            "ragionamento_mentore": "IA Errore/Timeout - Analisi non disponibile",
-            "analisi_logica": {},
-            "guardrail_applicato": False,
-            "lstm_predizione": "N/A",
-            "asset": symbol
-        }
-
-        if not dati:
-            logging.error("❌ Dati asset non forniti")
-            print("[DEBUG_BREAK] Return anticipato: dati mancanti")
-            return default_error
-
-        cached_analisi = self._usa_cache_se_valida(symbol)
-        if cached_analisi:
-            logging.info(f"[DEBUG_BREAK] Cache valida trovata per {symbol}")
-            print("[DEBUG_BREAK] Return anticipato: cache valida restituita")
-            return cached_analisi
-
-        if hasattr(self, 'lstm_predictor') and self.lstm_predictor is not None:
-            logging.info("[DEBUG] lstm_predictor presente, valutazione training")
-            print("[DEBUG] lstm_predictor presente, valutazione training")
-            if dati_storici_lstm and len(dati_storici_lstm) > 100:
-                try:
-                    accuracy = self.lstm_predictor.allena_modello(dati_storici_lstm)
-                    if accuracy is not None and accuracy > 0:
-                        logging.info(f"✅ LSTM Training completato: Accuracy {accuracy:.2%}")
-                        print(f"[DEBUG] LSTM training completato: {accuracy:.2%}")
-                except Exception as e:
-                    logging.warning(f"⚠️ Errore training LSTM: {e}")
-                    print(f"[DEBUG] Errore training LSTM: {e}")
-
-        lstm_predizione = "N/A"
-        try:
-            res_lstm = self.ottieni_predizione_lstm(dati_storici_lstm)
-            if res_lstm:
-                lstm_predizione = res_lstm
-                logging.info(f"[DEBUG] LSTM predizione ottenuta: {lstm_predizione}")
-                print(f"[DEBUG] LSTM predizione ottenuta")
-        except Exception as e:
-            lstm_predizione = "N/A"
-            logging.warning(f"⚠️ Errore ottieni_predizione_lstm: {e}")
-            print(f"[DEBUG] Errore ottieni_predizione_lstm: {e}")
-
-        memoria_trade = "STATO: Nessuna posizione aperta."
-        if posizione_attuale:
-            memoria_trade = f"ATTENZIONE: Posizione {posizione_attuale.get('direzione')} aperta a {posizione_attuale.get('p_entrata')}."
-
-        if not self.model_name:
-            logging.error("❌ Modello Gemini non disponibile")
-            print("[DEBUG_BREAK] Return anticipato: modello Gemini non disponibile")
-            return default_error
-
-        stringa_contesto = ""
-        if contesto_istituzionale:
-            try:
-                vwap = contesto_istituzionale.get('vwap', 'N/A')
-                cvd = contesto_istituzionale.get('cvd', 'N/A')
-                poc = contesto_istituzionale.get('poc', 'N/A')
-                stringa_contesto = (
-                    f"\n--- CONTESTO ISTITUZIONALE ---\n"
-                    f"- VWAP: {vwap} | CVD: {cvd} | POC: {poc}\n"
-                )
-            except Exception as e:
-                logging.warning(f"⚠️ Errore contesto: {e}")
-                print(f"[DEBUG] Errore formattazione contesto: {e}")
-
-        stringa_multitf = ""
-        if dati and 'multitimeframe' in dati:
-            try:
-                mtf = dati['multitimeframe']
-                stringa_multitf = (
-                    f"\n--- ANALISI MULTITIMEFRAME ---\n"
-                    f"- 1D: {mtf.get('1D', {}).get('trend')} | 4h: {mtf.get('4h', {}).get('trend')} | 1h: {mtf.get('1h', {}).get('trend')}\n"
-                )
-            except Exception as e:
-                logging.warning(f"⚠️ Errore multi-timeframe: {e}")
-                print(f"[DEBUG] Errore multi-timeframe: {e}")
-
-        stringa_lstm = ""
-        if isinstance(lstm_predizione, dict):
-            try:
-                stringa_lstm = (
-                    f"\n--- NEURAL PREDICTION (LSTM) ---\n"
-                    f"Direzione: {lstm_predizione.get('direzione')}\n"
-                    f"Variazione: {lstm_predizione.get('variazione_perc', 0):+.2f}%\n"
-                    f"Prezzo Predetto: {lstm_predizione.get('prezzo_predetto', 0):.2f}\n"
-                    f"Confidence: {lstm_predizione.get('confidence', 0):.1f}%\n"
-                )
-            except Exception as e:
-                logging.warning(f"⚠️ Errore formattazione stringa LSTM: {e}")
-                print(f"[DEBUG] Errore formattazione stringa LSTM: {e}")
-        else:
-            stringa_lstm = "\n--- NEURAL PREDICTION (LSTM) ---\nPredizione non disponibile.\n"
-
-        feedback_totale = f"{self._ottieni_feedback_storico(symbol)}"
-        stringa_guardrail = ""
-        if guardrail:
-            try:
-                voto_min = guardrail.get('voto_minimo', 0)
-                voto_max = guardrail.get('voto_massimo', 10)
-                ragioni_guardrail = guardrail.get('ragioni', [])
-                stringa_guardrail = (
-                    f"\n--- VINCOLI LOGICI (GUARDRAIL) ---\n"
-                    f"Voto obbligatorio tra {voto_min} e {voto_max}.\n"
-                    f"Motivi limitazione: {', '.join(ragioni_guardrail) if ragioni_guardrail else 'Nessuno'}\n"
-                )
-            except Exception as e:
-                logging.warning(f"⚠️ Errore iniezione guardrail: {e}")
-                print(f"[DEBUG] Errore iniezione guardrail: {e}")
-
-        try:
-            prezzo_real = dati.get('prezzo_real', 'N/A')
-            dati_per_json = {k: v for k, v in dati.items() if k not in ['multitimeframe', 'symbol']}
-            funding_rate = dati.get("funding_rate", 0)
-            if isinstance(funding_rate, tuple):
-                funding_rate = funding_rate[0]
-            if funding_rate is None:
-                funding_rate = 0
-            oi_data = contesto_istituzionale.get('open_interest') if contesto_istituzionale else None
-            if oi_data and isinstance(oi_data, dict):
-                oi_val = oi_data.get('oi', 'N/A')
-                oi_var = oi_data.get('oi_24h', 0)
-
-                oi_info = f"OI: {oi_val} (Var: {oi_var:+.2f}%)"
-            else:
-                oi_info = "OI: Non disponibile"
-
-            prompt = (
-                f"Analisi Professionale Asset: {symbol} | Prezzo: {prezzo_real}\n"
-                f"Ruolo: Master Trader SMC/VSA. Obiettivo: Istruire Andrea.\n"
-                f"{memoria_trade}\n"
-                f"{stringa_multitf}{stringa_contesto}"
-                f"FUNDING: {funding_rate:.5f} | {oi_info}\n"
-                f"{stringa_lstm}\n"
-                f"DATI: {json.dumps(dati_per_json, default=str)}\n"
-                f"MACRO: {json.dumps(macro_data, default=str)}\n"
-                f"{stringa_guardrail}\n"
-                "\nISTRUZIONI: Rispondi SOLO con un JSON valido. Sii critico."
-                "\nSTRUTTURA JSON RICHIESTA:\n"
-                "{\n"
-                '  "voto": float,\n'
-                '  "direzione": "LONG/SHORT/FLAT",\n'
-                '  "orizzonte": "INTRADAY",\n'
-                '  "modalita": "SPOT/LEVA",\n'
-                '  "sl": float, "tp": float,\n'
-                '  "ragionamento_mentore": "Spiegazione SMC/VSA per Andrea",\n'
-                '  "analisi_logica": {"mtf": "...", "istituzionali": "...", "oi_vol": "...", "lstm": "..."}\n'
-                "}"
-            )
-            with open("prompt_brain_debug.log", "a", encoding="utf-8") as f:
-                f.write(f"--- {symbol} {time.strftime('%H:%M:%S')} ---\n{prompt[:1000]}\n\n")
-            logging.info(f"[DEBUG] Prompt costruito per {symbol}, lunghezza {len(prompt)}")
-            print(f"[DEBUG] Prompt costruito per {symbol}, lunghezza {len(prompt)}")
-        except Exception as e:
-            logging.error(f"❌ Errore costruzione prompt: {e}")
-            print(f"[DEBUG_BREAK] Return anticipato: errore costruzione prompt: {e}")
-            return default_error
-
-        tentativi = 0
-        max_tentativi_reali = 2
-        while tentativi < max_tentativi_reali:
-            try:
-                self._applica_rate_limiting()
-                logging.info(f"[DEBUG] Chiamata a genera_analisi_ia per {symbol}, tentativo {tentativi+1}")
-                print(f"[DEBUG_CALL] Chiamata a genera_analisi_ia per {symbol}, tentativo {tentativi+1}")
-                response_text = self.genera_analisi_ia(prompt, api_key=self.api_key)
-                logging.info(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}")
-                print(f"[DEBUG] Response raw length: {len(response_text) if response_text else 0}")
-                if not response_text:
-                    print("[DEBUG] Risposta Gemini vuota, sollevamento eccezione per retry")
-                    raise ValueError("Risposta Gemini vuota")
-                analisi = self._pulisci_e_valida_json(response_text)
-                if not analisi or "voto" not in analisi:
-                    print("[DEBUG] JSON non valido o incompleto ricevuto")
-                    raise ValueError("JSON non valido o incompleto")
-                voto_originale = analisi.get("voto", 0)
-                voto_protetto, ragioni_applicate = self._applica_guardrail_logico(voto_originale, guardrail)
-                analisi.update({
-                    "voto": voto_protetto,
-                    "guardrail_applicato": (voto_originale != voto_protetto),
-                    "asset": symbol,
-                    "lstm_predizione": lstm_predizione
-                })
-                if not analisi.get("ragionamento_mentore"):
-                    analisi["ragionamento_mentore"] = "Analisi SMC completata."
-                for campo in ["sl", "tp"]:
-                    if analisi.get(campo) is None:
-                        analisi[campo] = 0
-                logging.info(f"✅ Analisi completata per {symbol}: Voto {voto_protetto}")
-                print(f"[DEBUG_BREAK] Analisi completata per {symbol}: Voto {voto_protetto}")
-                self._salva_in_cache(symbol, analisi)
-                return analisi
-            except Exception as e:
-                tentativi += 1
-                attesa = 5
-                # Log sintetico e completo del traceback
-                logging.warning(f"⚠️ Tentativo {tentativi} fallito per {symbol}: {e}")
-                logging.exception("Traceback completo dell'eccezione:")
-                # Proviamo a loggare la response grezza se esistente (evita NameError)
-                resp_val = locals().get('response_text', None)
-                if resp_val is not None:
-                    logging.debug(f"[DEBUG_FULL_RESPONSE] repr(response_text): {repr(resp_val)}")
-                    print(f"[DEBUG_FULL_RESPONSE] repr(response_text): {repr(resp_val)}", flush=True)
-                else:
-                    logging.debug("[DEBUG_FULL_RESPONSE] response_text non definita in questo contesto")
-                    print("[DEBUG_FULL_RESPONSE] response_text non definita in questo contesto", flush=True)
-                print(f"[DEBUG] Tentativo {tentativi} fallito per {symbol}: {e}", flush=True)
-                if tentativi < max_tentativi_reali:
-                    print(f"[DEBUG] Attendo {attesa}s prima del prossimo tentativo", flush=True)
-                    time.sleep(attesa)
-                else:
-                    print(f"[DEBUG_BREAK] Fine tentativi per {symbol}, esco con default_error", flush=True)
-                    break
-
-        logging.error(f"❌ Impossibile analizzare {symbol} dopo {tentativi} tentativi")
-        default_error["asset"] = symbol
-        default_error["lstm_predizione"] = lstm_predizione
-        print(f"[DEBUG_BREAK] Return finale default_error per {symbol}")
-        return default_error
-
-    def valuta_posizione_live(self, posizione, dati_correnti, contesto_istituzionale, pnl_percentuale):
-        try:
-            if not posizione or not dati_correnti or not contesto_istituzionale:
-                logging.warning("❌ Dati insufficienti per valutazione live")
-                return None
-            prezzo_att = dati_correnti.get('prezzo_real', 0)
-            rsi = dati_correnti.get('rsi', 50)
-            atr = dati_correnti.get('atr', 0)
-            if prezzo_att <= 0:
-                return None
-            prompt = f"""
-Tu sei un Master Trader che MONITORA un trade aperto.
-
-POSIZIONE ATTUALE:
-- Direzione: {posizione.get('direzione', 'UNKNOWN')}
-- Entry: {posizione.get('p_entrata', 0)}
-- SL: {posizione.get('sl', 0)}
-- TP: {posizione.get('tp', 0)}
-- P&L: {pnl_percentuale:.2f}%
-
-SITUAZIONE MERCATO ORA:
-- Prezzo: {prezzo_att}
-- RSI 1h: {rsi:.1f}
-- ATR: {atr:.2f}
-- VWAP: {contesto_istituzionale.get('vwap', 0)}
-- CVD: {contesto_istituzionale.get('cvd', 0)}
-- POC: {contesto_istituzionale.get('poc', 0)}
-
-RAGIONA COME UN VERO TRADER (NON REGOLE RIGIDE):
-
-1. Confidence nella posizione (0-100%)?
-2. Cosa fare adesso? Scegli UNA:
-   - HOLD (mantieni)
-   - REDUCE_SIZE (riduci rischio)
-   - TIGHTEN_SL (stringi stop)
-   - CLOSE (chiudi)
-3. Perché? (ragionamento)
-4. Se il prezzo sale/scende del 2%, cosa fai?
-5. Se CVD diventa molto negativo, cosa cambia?
-
-RISPONDI IN JSON:
-{{
-  "confidence": int (0-100),
-  "azione": "HOLD/REDUCE/TIGHTEN_SL/CLOSE",
-  "ragione": "spiegazione breve",
-  "nuovo_sl_suggerito": float o null,
-  "nuovo_tp_suggerito": float o null,
-  "scenario_se_su_2_pct": "cosa fai",
-  "scenario_se_cvd_negativo": "cosa fai",
-  "flessibilita": "note sulla situazione (es: mercato confuso, trend forte, ecc)"
-}}
 """
-            self._applica_rate_limiting()
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt
-            )
-            logging.info(f"[DEBUG_GEMINI_RAW] {response}")
-            if not response or not response.text:
-                logging.warning("⚠️ Risposta Gemini vuota per valutazione live")
-                return None
-            valutazione = self._pulisci_e_valida_json(response.text)
-            if not valutazione or "confidence" not in valutazione:
-                logging.warning("⚠️ JSON invalido per valutazione live")
-                return None
-            valutazione["confidence"] = max(0, min(100, int(valutazione.get("confidence", 50))))
-            valutazione["azione"] = valutazione.get("azione", "HOLD").upper()
-            valutazione["ragione"] = valutazione.get("ragione", "Valutazione completata")
-            valutazione["flessibilita"] = valutazione.get("flessibilita", "")
-            logging.info(
-                f"🔍 LIVE EVAL: {valutazione['azione']} "
-                f"({valutazione['confidence']}% conf) - {valutazione['ragione'][:50]}"
-            )
-            return valutazione
-        except Exception as e:
-            logging.error(f"❌ Errore valutazione live: {e}")
-            import traceback; traceback.print_exc()
+BrainLA - Enterprise AI Trading Bot (ALL components)
+Versione 3.0: Intelligence Boost + Fix Report Sincronizzati
+"""
+print("🟢🟢 LOADING core/brain_la.py - ARCHITETTURA PULITA 🟢🟢")
+
+import logging
+import json
+import threading
+import time
+from datetime import datetime
+from collections import deque
+import random
+import google.genai as genai
+from pydantic import BaseModel, ValidationError, field_validator
+
+from core.config_la import GEMINI_API_KEY, KRAKEN_KEY, KRAKEN_SECRET
+from core.asset_list import get_ticker
+from core.feedback_engine import FeedbackEngine
+
+# --- COLLEGAMENTO MODULI ESTERNI ---
+from core import engine_la
+from core import institutional_filters
+from core import macro_sentiment
+from core import asset_list
+from core import performer_la
+from core import trade_manager
+from core import config_la
+
+try:
+    import streamlit as st
+    from flask import Flask, request, jsonify
+except ImportError:
+    pass
+
+############################################
+# --- Risk/Compliance ---
+############################################
+
+class RiskManager:
+    def check_risk(self, decision, account_limits=None):
+        sizing = decision.get("sizing", 0)
+        try:
+            sizing_val = float(sizing)
+            if sizing_val <= 0 or sizing_val > 1:
+                return False, f"⚠️ SIZING BLOCCATO: {sizing_val} fuori range."
+            max_limit = account_limits.get("max_size", 0.1) if account_limits else 0.1
+            if sizing_val > max_limit:
+                return False, f"⚠️ RISCHIO ECCESSIVO: Sizing {sizing_val} > {max_limit}"
+            sl = decision.get("sl")
+            tp = decision.get("tp")
+            if sl and tp:
+                f_sl = float(sl); f_tp = float(tp)
+                if abs(f_sl - f_tp) < 0.0000001:
+                    return False, f"⚠️ BLOCCO CRITICO: SL ({f_sl}) e TP ({f_tp}) coincidono."
+            return True, ""
+        except (TypeError, ValueError):
+            return False, "❌ ERRORE CRITICO: Calcolo numerico rischio fallito."
+
+############################################
+# --- Strategy Manager (placeholder) ---
+############################################
+
+class StrategyManager:
+    def select_strategy(self, asset, dati, storico):
+        return "ia_institutional"
+
+############################################
+# --- Error Handler / Schema ---
+############################################
+
+from pydantic import BaseModel, field_validator
+from typing import Optional, Union, Dict
+
+class DecisionSchema(BaseModel):
+    direzione: str
+    voto: int
+    sizing: float
+    leverage: Union[float, int]
+    sl: Optional[Union[float, int]] = None
+    tp: Optional[Union[float, int]] = None
+    tipo_operazione: str = "N/A"
+    timeframe_riferimento: str = "N/A"
+    
+    # --- NUOVO CAMPO PER TRASPARENZA PROJECT CHIMERA ---
+    score_breakdown: Dict[str, int] = {} # Es: {"CVD": 8, "Liquidity": 7, "Velocity": 9}
+    
+    apprendimento_critico: str = ""
+    razionale: str = ""
+
+    @field_validator("direzione")
+    def direzione_ok(cls, v):
+        if not v: return "FLAT"
+        v = str(v).upper().strip().replace("BUY", "LONG").replace("SELL", "SHORT")
+        if v not in ("LONG", "SHORT", "FLAT"):
+            return "FLAT"
+        return v
+
+    @field_validator("voto")
+    def voto_ok(cls, v):
+        try: 
+            return max(0, min(10, int(v)))
+        except: 
+            return 0
+
+    @field_validator("sizing")
+    def sizing_ok(cls, v):
+        try: 
+            val = float(v)
+            return max(0.0, min(1.0, val))
+        except: 
+            return 0.0
+
+    @field_validator("leverage")
+    def lev_ok(cls, v):
+        try: 
+            return max(1.0, min(5.0, float(v)))
+        except: 
+            return 1.0
+
+    @field_validator("sl", "tp", mode="before")
+    def numeric_or_none(cls, v):
+        if v is None or v == 0 or v == "0" or v == "None":
+            return None
+        try:
+            return float(v)
+        except:
             return None
 
-# ---------------------------
-# Helper a livello modulo (spostato fuori dalla classe per riuso globale)
-# ---------------------------
-def _estrai_testo_da_response(response):
-    """
-    Estrae in modo robusto una stringa di testo dalla response del client.
-    """
-    try:
-        # Se è oggetto con .text
-        if hasattr(response, "text"):
-            return response.text
-        # Se è dict
-        if isinstance(response, dict):
-            if "output" in response:
-                out = response["output"]
-                if isinstance(out, list):
-                    parts = []
-                    for it in out:
-                        if isinstance(it, dict):
-                            parts.append(it.get("content") or it.get("text") or str(it))
+    @field_validator("score_breakdown", mode="before")
+    def validate_scores(cls, v):
+        """ Assicura che i voti singoli siano sempre tra 0 e 10 """
+        if not isinstance(v, dict):
+            return {}
+        return {k: max(0, min(10, int(val))) for k, val in v.items() if isinstance(val, (int, float, str))}
+        
+class ErrorHandler:
+    def validate_ia_output(self, raw_json_text):
+        try:
+            if "```json" in raw_json_text:
+                raw_json_text = raw_json_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw_json_text:
+                raw_json_text = raw_json_text.split("```")[1].split("```")[0].strip()
+            
+            decision_dict = json.loads(raw_json_text)
+            
+            # --- FIX ANTI-SCHEMA-FAIL ---
+            if 'leverage' not in decision_dict:
+                decision_dict['leverage'] = 1.0  # Default se l'IA lo dimentica
+            # ----------------------------
+                
+            decision_dict['direzione'] = decision_dict.get('direzione', 'FLAT')
+        except Exception:
+            return {"direzione": "FLAT", "voto": 0, "sizing": 0, "leverage": 1, "razionale": "JSON invalid"}
+            
+        try:
+            model = DecisionSchema(**decision_dict)
+            return model.model_dump()
+        except ValidationError as e:
+            # Il log dell'errore in formato JSON ti permetterà di vedere esattamente 
+            # quale campo (es. 'tp' o 'score_breakdown') ha fallito la validazione.
+            self.logger.error(f"⚠️ Errore Validazione Schema {asset_name}: {e.json()}")
+    
+            return {
+                "direzione": "FLAT", 
+                "voto": 0, 
+                "sizing": 0, 
+                "leverage": 1.0, 
+                "razionale": f"Schema fail: {str(e)}"
+            }
+############################################
+# --- Testing ---
+############################################
+
+class TestRunner:
+    def unit_test(self, func, args):
+        try:
+            res = func(*args)
+            return True, res
+        except Exception as e:
+            return False, str(e)
+
+############################################
+# --- BrainLA MAIN CLASS ---
+############################################
+
+class BrainLA:
+
+    def __init__(self, gemini_api_key=None, gemini_model_name="gemini-2.0-flash", 
+                 api_key=None, api_secret=None, logger=None, account_limits=None, 
+                 feedback_engine=None, alerts=None): # <--- Aggiunto alerts
+        self.gemini_api_key = gemini_api_key or GEMINI_API_KEY
+        self.client = genai.Client(api_key=self.gemini_api_key)
+        self.gemini_model_name = gemini_model_name
+        self.logger = logger or logging.getLogger("BrainLA")
+        self.api_key = api_key or KRAKEN_KEY
+        self.api_secret = api_secret or KRAKEN_SECRET
+        self.account_limits = account_limits or {"max_size": 0.1}
+        self.risk_manager = RiskManager()
+        self.error_handler = ErrorHandler()
+        self.strategy_manager = StrategyManager()
+        self.dashboard_buffer = []
+        self.feedback_engine = feedback_engine or FeedbackEngine()
+        
+        # --- COLLEGAMENTO TELEGRAM ---
+        self.alerts = alerts # <--- Salvato per l'invio del razionale
+        # -----------------------------
+
+        self.trade_manager = None  # viene collegato da bot_la
+        self._llm_calls = deque()   # timestamps delle ultime chiamate
+        self._llm_rate_limit = 12   # max chiamate al minuto
+    
+    def _throttle_llm(self):
+        now = time.time()
+        window = 60
+        while self._llm_calls and self._llm_calls[0] < now - window:
+            self._llm_calls.popleft()
+        if len(self._llm_calls) >= self._llm_rate_limit:
+            wait = (self._llm_calls[0] + window) - now + random.uniform(0, 0.5)
+            self.logger.warning(f"⏳ Throttle LLM: attendo {wait:.1f}s")
+            time.sleep(max(wait, 0))
+        time.sleep(random.uniform(0.3, 0.8))  # jitter anti-burst
+        self._llm_calls.append(time.time())
+    
+    def calcola_z_score(self, serie_prezzi, finestra=20):
+        """Calcola lo Z-Score statistico per identificare eccessi di mercato."""
+        import pandas as pd
+        import numpy as np
+    
+        if len(serie_prezzi) < finestra:
+            return 0.0
+        
+        df = pd.Series(serie_prezzi)
+        media = df.rolling(window=finestra).mean()
+        std_dev = df.rolling(window=finestra).std()
+    
+        z_score_series = (df - media) / std_dev
+        return float(z_score_series.iloc[-1]) if not np.isnan(z_score_series.iloc[-1]) else 0.0
+
+    def valuta_ingresso(self, asset, dati_mercato):
+        """
+        Analizza se ci sono le condizioni per un ingresso.
+        Integrazione: Visualizzazione Matrice Decisionale Project Chimera e Filtri Rischio.
+        """
+        try:
+            # --- NORMALIZZAZIONE IMMEDIATA ---
+            from core.asset_list import get_ticker
+            ticker_ufficiale = get_ticker(asset)
+            
+            chiusure = dati_mercato.get('storico_chiusure', [])
+            prezzo_attuale = dati_mercato.get('close')
+            
+            if not chiusure or prezzo_attuale is None:
+                return None
+                
+            # Calcolo dello Z-Score
+            z_score = self.calcola_z_score(chiusure)
+            
+            # Chiediamo a Gemini solo se lo Z-Score indica un'opportunità statistica
+            if abs(z_score) > 2.0:
+                # Recupero narrativa per rendere il prompt più intelligente
+                narrativa = self._get_technical_narrative(dati_mercato)
+                
+                prompt = (
+                    f"Asset: {ticker_ufficiale}\n"
+                    f"Prezzo: {prezzo_attuale}\n"
+                    f"Z-Score: {z_score:.2f}\n"
+                    f"Contesto: {narrativa}\n"
+                    "Analizza e decidi: BUY, SELL o FLAT. Fornisci 'score_breakdown' per pilastri Chimera."
+                )
+                
+                # Chiama Gemini (ritorna un dict)
+                analisi = self.chiama_gemini(prompt, is_json=True)
+                
+                # --- INTEGRAZIONE PROTOCOLLI CHIMERA (Policy & Risk) ---
+                # 1. Applica aggiustamenti basati su Win Rate/Streak
+                analisi = self._policy_adjust(ticker_ufficiale, analisi, dati_mercato)
+                
+                # 2. Controllo Fase Due (Velocity)
+                fase_due_attiva = False
+                if analisi.get('direzione') != "FLAT":
+                    fase_due_attiva, motivo, tp_esteso = self.analizza_fase_due_chimera(
+                        ticker_ufficiale, dati_mercato, analisi.get('direzione')
+                    )
+                    if fase_due_attiva:
+                        analisi['tp'] = tp_esteso
+                        analisi['razionale'] += f" | {motivo}"
+                
+                # --- RECUPERO DATI E MATRICE VOTI ---
+                scores = analisi.get('score_breakdown', {})
+                razionale = analisi.get('razionale', 'Nessuna spiegazione fornita.')
+                direzione = analisi.get('direzione', 'FLAT')
+                voto_globale = analisi.get('voto', 0)
+
+                # --- VISUALIZZAZIONE LOG ANALITICA ---
+                self.logger.info(f"🧠 ANALISI PROGETTO CHIMERA per {ticker_ufficiale}:")
+                self.logger.info(f"    ➤ Direzione: {direzione} | Voto Globale: {voto_globale}/10")
+                
+                if scores:
+                    for pilastro, voto in scores.items():
+                        self.logger.info(f"      ● {pilastro.replace('_', ' ')}: {voto}/10")
+                
+                self.logger.info(f"    ➤ RAZIONALE: {razionale}")
+
+                if direzione != "FLAT":
+                    # --- INVIO ALERT TELEGRAM ---
+                    if hasattr(self, 'alerts') and self.alerts:
+                        lista_voti_str = "\n".join([f"• {k.replace('_', ' ')}: {v}/10" for k, v in scores.items()]) if scores else "N/A"
+                        f2_str = "🔥 PHASE TWO ATTIVA" if fase_due_attiva else "Standard"
+                        
+                        msg = (
+                            f"🚀 *SEGNALE CHIMERA: {direzione}*\n"
+                            f"📈 *Asset:* {ticker_ufficiale}\n"
+                            f"💰 *Prezzo:* {prezzo_attuale}\n"
+                            f"⭐ *Voto Globale:* {voto_globale}/10\n"
+                            f"⚡ *Modo:* {f2_str}\n\n"
+                            f"📊 *Matrice Decisionale:*\n{lista_voti_str}\n\n"
+                            f"🧠 *Razionale:* {razionale}"
+                        )
+                        
+                        self.alerts.invia_alert(msg)
+
+                    return {
+                        "asset": ticker_ufficiale,
+                        "action": direzione,
+                        "sl": analisi.get('sl', prezzo_attuale * 0.98),
+                        "tp": analisi.get('tp', prezzo_attuale * 1.05),
+                        "voto": voto_globale,
+                        "leverage": analisi.get('leverage', 1),
+                        "score_breakdown": scores,
+                        "razionale": razionale,
+                        "fase_due": fase_due_attiva
+                    }
+
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"❌ Errore critico valuta_ingresso: {e}")
+            return None
+    
+    def chiama_gemini(self, prompt, is_json=True):
+        from google.genai import types
+        import json
+        import time
+        
+        # Import locale per pydantic se non globale
+        try:
+            from pydantic import ValidationError
+        except ImportError:
+            ValidationError = Exception
+
+        max_retries = 3
+        
+        # Allineamento dinamico delle System Instructions (Integrazione Project Chimera)
+        if is_json:
+            system_instruction = (
+                "Sei un trader istituzionale esperto in Order Flow (Project Chimera). Rispondi ESCLUSIVAMENTE in formato JSON puro. "
+                "Non includere spiegazioni fuori dal JSON. "
+                "Campi obbligatori: direzione (BUY/SELL/FLAT), voto (0-10), sizing (0-1), leverage, sl, tp, "
+                "tipo_operazione, timeframe_riferimento, score_breakdown, apprendimento_critico, razionale. "
+                "In 'score_breakdown', DEVI votare (0-10): Order_Flow, Liquidity, Market_Regime, Velocity, Volatility. "
+                "Se riscontri incertezza, direzione FLAT e voto 0."
+            )
+        else:
+            system_instruction = (
+                "Sei un analista quantitativo e trader istituzionale. "
+                "Fornisci un report discorsivo, professionale, chiaro e dettagliato."
+            )
+            
+        full_prompt = f"{system_instruction}\n\n{prompt}"
+
+        for i in range(max_retries):
+            try:
+                # Backoff esponenziale per evitare congestione
+                wait_time = 2.0 * (i + 1)
+                time.sleep(wait_time) 
+                
+                response = self.client.models.generate_content(
+                    model=self.gemini_model_name, 
+                    contents=full_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        candidate_count=1
+                    )
+                )
+                
+                if response and response.text:
+                    testo_output = response.text.strip()
+                    
+                    if not is_json:
+                        return testo_output
+                        
+                    # Pulizia e isolamento del blocco JSON
+                    try:
+                        if "{" in testo_output:
+                            json_start = testo_output.find("{")
+                            json_end = testo_output.rfind("}") + 1
+                            testo_json = testo_output[json_start:json_end]
+                            
+                            decision_dict = json.loads(testo_json)
+                            
+                            # Se esiste DecisionSchema, validiamo
+                            try:
+                                from core.brain_la import DecisionSchema
+                                validated_data = DecisionSchema(**decision_dict)
+                                return validated_data.model_dump()
+                            except (ImportError, NameError):
+                                # Se non disponibile, restituiamo il dict pulito
+                                return decision_dict
                         else:
-                            parts.append(str(it))
-                    return " ".join(parts)
-                return str(out)
-            if "candidates" in response:
-                cand = response["candidates"]
-                if isinstance(cand, list) and cand:
-                    first = cand[0]
-                    if isinstance(first, dict):
-                        return first.get("content") or first.get("text") or str(first)
-                    return str(first)
-            if "text" in response:
-                return response["text"]
-            # altrimenti fallback
-            return str(response)
-        # fallback generico
-        return str(response)
-    except Exception:
-        import traceback; traceback.print_exc()
-    return str(response)
+                            raise ValueError("Nessun blocco JSON trovato nella risposta")
+                            
+                    except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                        self.logger.error(f"🔴 Errore parsing/validazione JSON (Tentativo {i+1}): {e}")
+                        if i == max_retries - 1: break
+                        continue 
+
+            except Exception as e:
+                if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e).upper():
+                    self.logger.warning(f"⚠️ Rate limit Gemini (Tentativo {i+1}). Attendo {10 * (i+1)}s...")
+                    time.sleep(10 * (i+1))
+                else:
+                    self.logger.error(f"🔴 Errore critico Gemini: {e}")
+                    break
+        
+        # Fallback sicuro Project Chimera
+        if not is_json:
+            return "Errore nella generazione del report. Verificare i log."
+            
+        return {
+            "direzione": "FLAT", 
+            "voto": 0, 
+            "sizing": 0, 
+            "leverage": 1, 
+            "sl": 0, 
+            "tp": 0, 
+            "tipo_operazione": "none",
+            "timeframe_riferimento": "none",
+            "score_breakdown": {
+                "Order_Flow": 0, "Liquidity": 0, "Market_Regime": 0, "Velocity": 0, "Volatility": 0
+            },
+            "apprendimento_critico": "api_failure",
+            "razionale": "api_failure_fallback"
+        }
+    def get_kraken_balance(self):
+        temp_engine = engine_la.EngineLA(api_key=self.api_key, api_secret=self.api_secret)
+        return temp_engine.get_balance_real()
+
+    def valuta_modifica_posizione(self, dati_engine, posizione):
+        p_entrata = posizione.get("p_entrata", 0)
+        tp_new, sl_new, ts_new = self.determina_tp_sl_ts(
+            asset_name=posizione.get('asset'),
+            direzione=posizione.get('direzione'),
+            prezzo_ingresso=p_entrata,
+            dati_engine=dati_engine
+        )
+        return (str(sl_new) != str(posizione.get("sl")) or str(tp_new) != str(posizione.get("tp")))
+
+    def determina_tp_sl_ts(self, asset_name, direzione, prezzo_ingresso, dati_engine, levels_ia=None):
+        """
+        VERSIONE CHIMERA UNLEASHED: 
+        Elimina i blocchi fissi. Lo SL si adatta ai muri volumetrici reali.
+        """
+        try:
+            from core.asset_list import get_ticker, ASSET_CONFIG
+            ticker_ufficiale = get_ticker(asset_name)
+            conf = ASSET_CONFIG.get(ticker_ufficiale, {})
+            prec = conf.get("precision", 2) 
+            
+            if not prezzo_ingresso or prezzo_ingresso <= 0:
+                return 0, 0, 0
+
+            # 1. Recupero Volatilità e Liquidity Pools
+            atr_val = 0
+            pools = {}
+            if isinstance(dati_engine, dict):
+                atr_val = dati_engine.get('atr', 0)
+                pools = dati_engine.get('liquidity_pools', {})
+                if isinstance(atr_val, dict): atr_val = atr_val.get('value', 0)
+            
+            # ATR Reale: minimo di sicurezza 0.4% per evitare SL troppo stretti
+            atr = float(atr_val) if float(atr_val) > (prezzo_ingresso * 0.004) else prezzo_ingresso * 0.005
+            velocity = dati_engine.get('price_velocity', 0.0) if isinstance(dati_engine, dict) else 0
+            
+            direzione = str(direzione).upper()
+            
+            # 2. Logica SL Adattiva (Muri > Rumore)
+            # Se la velocity è alta (trend forte), riduciamo il moltiplicatore (meno rumore)
+            moltiplicatore_rumore = 0.8 if abs(velocity) > 0.0006 else 1.2
+            
+            # Recupero SL suggerito dall'IA (Chimera Brain) con validazione
+            sl_ia = float(levels_ia.get('sl')) if (isinstance(levels_ia, dict) and levels_ia.get('sl')) else None
+
+            if direzione in ['BUY', 'LONG']:
+                muri_sup = pools.get('pools_supporto', [])
+                # Cerchiamo il muro volumetrico più vicino sotto il prezzo d'ingresso
+                muro_valido = next((m['prezzo'] for m in muri_sup if m['prezzo'] < prezzo_ingresso), None)
+                
+                # Gerarchia: Muro Volumetrico -> Suggerimento IA -> ATR Dinamico
+                sl = muro_valido if muro_valido else (sl_ia if sl_ia and sl_ia < prezzo_ingresso else prezzo_ingresso - (atr * moltiplicatore_rumore))
+                
+                # Protezione: Mai SL più vicino dello 0.6% (copertura commissioni/slippage)
+                limit_sicurezza = prezzo_ingresso * 0.994
+                sl = min(sl, limit_sicurezza)
+
+                # Take Profit: Primo muro resistenza o 3x ATR
+                muri_res = pools.get('pools_resistenza', [])
+                tp_muro = muri_res[0]['prezzo'] if muri_res else None
+                tp = tp_muro if tp_muro and tp_muro > prezzo_ingresso else prezzo_ingresso + (atr * 3.0)
+
+            elif direzione in ['SELL', 'SHORT']:
+                muri_res = pools.get('pools_resistenza', [])
+                # Cerchiamo il muro volumetrico più vicino sopra il prezzo d'ingresso
+                muro_valido = next((m['prezzo'] for m in muri_res if m['prezzo'] > prezzo_ingresso), None)
+                
+                sl = muro_valido if muro_valido else (sl_ia if sl_ia and sl_ia > prezzo_ingresso else prezzo_ingresso + (atr * moltiplicatore_rumore))
+                
+                # Protezione: Mai SL più vicino dello 0.6%
+                limit_sicurezza = prezzo_ingresso * 1.006
+                sl = max(sl, limit_sicurezza)
+
+                muri_sup = pools.get('pools_supporto', [])
+                tp_muro = muri_sup[0]['prezzo'] if muri_sup else None
+                tp = tp_muro if tp_muro and tp_muro < prezzo_ingresso else prezzo_ingresso - (atr * 3.0)
+            
+            else:
+                return 0, 0, 0
+
+            # --- VALIDAZIONE E RITORNO ---
+            tp_final = round(float(tp), prec)
+            sl_final = round(float(sl), prec)
+            distanza_trailing = round(atr * 1.5, prec) # Valore consigliato per il TS
+
+            self.logger.info(f"🛡️ SINERGIA CHIMERA {ticker_ufficiale}: SL {sl_final} | TP {tp_final} (Atr: {atr:.2f})")
+            return tp_final, sl_final, distanza_trailing
+
+        except Exception as e:
+            self.logger.error(f"❌ Errore sinergia determina_tp_sl_ts: {e}")
+            return 0, 0, 0
+    def analizza_fase_due_chimera(self, asset, dati_engine, direzione_pos):
+        """
+        PROJECT CHIMERA - Analisi Velocity per attivazione Phase Two.
+        Soglia ricalibrata per catturare trend istituzionali reali.
+        """
+        try:
+            velocity = dati_engine.get('price_velocity', 0.0)
+            prezzo_attuale = dati_engine.get('close', 0)
+            
+            # Validazione di sicurezza sul prezzo
+            if prezzo_attuale <= 0:
+                return False, None, None
+            
+            # SOGLIA CHIMERA CALIBRATA: 0.0006 (0.06% al secondo)
+            # Sopra questa soglia il movimento è guidato da HFT/Algoritmi
+            soglia = 0.0006 
+            
+            # LONG + Velocity Positiva (Accelerazione verso l'alto)
+            if direzione_pos == "BUY" and velocity > soglia:
+                motivo = f"🚀 Momentum HFT Rialzista: {velocity:.5f} %/sec"
+                # TP Esteso del 15% per dare spazio al Trailing Stop di lavorare
+                tp_esteso = round(float(prezzo_attuale) * 1.15, 2) 
+                return True, motivo, tp_esteso
+            
+            # SHORT + Velocity Negativa (Accelerazione verso il basso)
+            elif direzione_pos == "SELL" and velocity < -soglia:
+                motivo = f"📉 Momentum HFT Ribassista: {velocity:.5f} %/sec"
+                # TP Esteso del 15% (al ribasso)
+                tp_esteso = round(float(prezzo_attuale) * 0.85, 2) 
+                return True, motivo, tp_esteso
+
+            return False, None, None
+
+        except Exception as e:
+            self.logger.error(f"❌ Errore analizza_fase_due_chimera su {asset}: {e}")
+            return False, None, None
+    def check_chimera_phase_two(self, ticker, dati_engine):
+        """
+        PROJECT CHIMERA - Step 1: Estrazione e validazione Velocity.
+        """
+        try:
+            velocity = dati_engine.get('price_velocity', 0.0)
+            
+            # SOGLIA COERENTE: 0.0006
+            if abs(velocity) > 0.0006:
+                self.logger.info(f"⚡ [CHIMERA TRIGGER] Velocity rilevata su {ticker}: {velocity:.6f}")
+                return True, velocity
+            
+            return False, velocity
+        except Exception as e:
+            self.logger.error(f"❌ Errore check_chimera_phase_two: {e}")
+            return False, 0.0
+    def _policy_adjust(self, asset_name, decision, dati_engine):
+        """
+        Adattamento dinamico della strategia basato su performance storiche e segnali estremi.
+        Versione blindata Project Chimera.
+        """
+        try:
+            metrics = self.feedback_engine.get_asset_metrics(asset_name, window=50)
+            win_rate = float(metrics.get("win_rate", 50))
+            streak_loss = int(metrics.get("streak_loss", 0))
+            z = float(dati_engine.get('z_score', 0))
+            fz = float(dati_engine.get('funding_z_score', 0))
+
+            # 1. FILTRO ANTI-ESTREMI (Protezione Istituzionale)
+            if z > 2 and fz > 2 and decision['direzione'] == "BUY":
+                decision['voto'] = max(0, decision.get('voto', 0) - 1)
+                decision['razionale'] += " | ⚠️ Protezione: Z-Score/Funding alti su BUY"
+                
+            if z < -2 and fz < -2 and decision['direzione'] == "SELL":
+                decision['voto'] = max(0, decision.get('voto', 0) - 1)
+                decision['razionale'] += " | ⚠️ Protezione: Z-Score/Funding bassi su SELL"
+
+            # 2. ADATTAMENTO VOTO SU PERFORMANCE
+            if win_rate < 40:
+                decision['voto'] = max(0, decision.get('voto', 0) - 1)
+            elif win_rate > 60:
+                decision['voto'] = min(10, decision.get('voto', 0) + 1)
+
+            # 3. KILL SWITCH (Losing Streak o Voto Zero)
+            if streak_loss >= 3:
+                decision['direzione'] = "FLAT"
+                decision['razionale'] += " | 🔒 Cooldown: 3+ perdite consecutive"
+            
+            if decision.get('voto', 0) <= 0:
+                decision['direzione'] = "FLAT"
+                decision['razionale'] += " | 🛑 Voto insufficiente dopo filtri policy"
+
+            # 4. KELLY-LIKE SIZING (Ricalibrato)
+            # Calcolo dell'edge: se win_rate > 50%, factor > 1.0
+            edge = (win_rate / 100.0) - (1.0 - (win_rate / 100.0))
+            factor = max(0.2, min(1.5, 1.0 + edge))
+            
+            current_sizing = float(decision.get('sizing', 0.15))
+            decision['sizing'] = round(current_sizing * factor, 5)
+
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"❌ Errore critico in policy_adjust: {e}")
+            decision['sizing'] = 0.10 # Sicurezza
+
+        return decision
+        
+    def _apply_prior(self, asset_name, decision):
+        prior = self.feedback_engine.get_prior_signal(asset_name)
+        if not prior:
+            return decision
+
+        diff = abs(decision.get('voto', 0) - prior['prior_voto'])
+
+        # Disaccordo forte: FLAT
+        if diff >= 4:
+            decision['direzione'] = "FLAT"
+            decision['sizing'] = 0
+            decision['razionale'] += f" | prior RF molto in disaccordo ({prior['prior_voto']}) -> FLAT"
+            return decision
+
+        # Disaccordo moderato: taglia la size
+        if diff >= 2:
+            decision['sizing'] = round(decision.get('sizing', 0) * 0.5, 5)
+            decision['razionale'] += f" | prior RF disagrees ({prior['prior_voto']}) sizing 50%"
+        elif diff <= 1 and prior['prior_conf'] > 0.55:
+            decision['sizing'] = min(1.0, round(decision.get('sizing', 0) * 1.2, 5))
+            decision['voto'] = int(round((decision.get('voto', 0) + prior['prior_voto']) / 2))
+            decision['razionale'] += f" | prior RF aligned ({prior['prior_voto']}) sizing +20%"
+
+        return decision
+
+    def full_global_strategy(self, dati_engine, asset_name, macro_sentiment, performance_history=None):
+        # --- FIX: NORMALIZZAZIONE IMMEDIATA TICKER ---
+        from core.asset_list import get_ticker
+        import json
+        from datetime import datetime
+        ticker_ufficiale = get_ticker(asset_name)
+
+        # --- 1. ESTRAZIONE INTEGRALE SENSORI ENGINE ---
+        entry_price = dati_engine.get('close', 0)
+        atr = dati_engine.get('atr', 0)
+        atr_p = (atr / entry_price * 100) if entry_price > 0 else 0
+        
+        # --- AGGIUNTA CHIMERA: RECUPERO HEALTH INDEX ---
+        market_health = dati_engine.get('health_data', {}).get('score', 0.5) if isinstance(dati_engine.get('health_data'), dict) else 0.5
+        
+        # Gestione Spread
+        spread = dati_engine.get('spread', 0) 
+        if spread == 0:
+            spread_p = dati_engine.get('spread_perc', 0)
+        else:
+            spread_p = (spread / entry_price * 100) if entry_price > 0 else 0
+
+        # --- FIX AGGANCIO PROJECT CHIMERA (Parametri Core) ---
+        vpin = dati_engine.get('vpin', 0)
+        vpin_delta = dati_engine.get('vpin_trend', 0)
+        hurst = dati_engine.get('hurst_exponent', 0.5)
+        z_score = dati_engine.get('z_score', 0)
+        regime_hmm = dati_engine.get('market_regime', 'UNKNOWN')
+        market_regime = regime_hmm
+        market_efficiency = dati_engine.get('kaufman_efficiency', 1.0)
+        
+        # Estrazione Order Flow (Protetto da sovrascritture errate)
+        cvd_chimera = dati_engine.get('cvd', 0)
+        cvd_value = cvd_chimera # Alias per coerenza prompt
+        velocity_chimera = dati_engine.get('price_velocity', 0)
+        is_explosive = dati_engine.get('is_explosive', False)
+        spoofing = dati_engine.get('indice_spoofing', 0)
+        iceberg = dati_engine.get('iceberg_presenti', False)
+        cvd_divergence = dati_engine.get('cvd_divergence', False)
+        prev_vah = dati_engine.get('vah_ieri', dati_engine.get('vah', 0))
+        prev_val = dati_engine.get('val_ieri', dati_engine.get('val', 0))
+
+        # Parametri Secondari e Microstruttura
+        rolling_vol = dati_engine.get('rolling_volatility', 0)
+        rvol = dati_engine.get('macro_proxy', {}).get('relative_volume_status', 1.0)
+        bp = dati_engine.get('book_pressure', 1.0)
+        funding_z = dati_engine.get('funding_z_score', 0)
+        rsi = dati_engine.get('rsi', 50)
+        mac_d = dati_engine.get('mac_d', 0)
+        book_delta = dati_engine.get('book_delta', 0)
+        funding_actual = dati_engine.get('actual_funding_rate', 0)
+        level_stability = dati_engine.get('level_stability_index', 1.0)
+        book_skew = dati_engine.get('book_skewness', 0)
+        vol_imbalance = dati_engine.get('volume_imbalance', 1.0)
+        corr_index = dati_engine.get('correlation_with_market', 1.0)
+        gap_liquidita = dati_engine.get('liquidity_gap', False)        
+        aggressivita_flow = dati_engine.get('aggressivita_order_flow', 'NEUTRAL')
+        signal_age = dati_engine.get('seconds_since_update', 0)
+        vwap = dati_engine.get('vwap', entry_price)
+        
+        # Area Valore e Muri
+        poc = dati_engine.get('poc', 0)
+        vah = dati_engine.get('vah', 0)
+        val = dati_engine.get('val', 0)
+        hvn = dati_engine.get('high_volume_nodes', [])
+        lvn = dati_engine.get('low_volume_nodes', [])
+
+        # Dati aggiuntivi HFT
+        buy_imb = dati_engine.get('buy_imbalance_levels', [])
+        sell_imb = dati_engine.get('sell_imbalance_levels', [])
+        prob_return = dati_engine.get('stat_return_prob', 0)
+        z_dist_vwap = dati_engine.get('distance_zscore_vwap', 0)
+        ofi = dati_engine.get('order_flow_imbalance', 0)
+        latency = dati_engine.get('kraken_latency', 0)
+        
+        # Recupero Muri (Fix per evitare Muri H1: 0)
+        muro_s_prezzo = dati_engine.get('muro_supporto', 0)
+        muro_r_prezzo = dati_engine.get('muro_resistenza', 0)
+        dist_supporto = dati_engine.get('dist_supporto', 999.0)
+        dist_resistenza = dati_engine.get('dist_resistenza', 999.0)
+        
+        
+        # --- 2. GERARCHIA CHIMERA: 4H | 1H | 15M ---
+        quadro_4h = {
+            "trend_primario": "BULLISH" if hurst > 0.55 and z_score > 0 else "BEARISH" if hurst > 0.55 and z_score < 0 else "CONSOLIDAMENTO",
+            "volatilita_macro": round(atr_p, 2),
+            "regime_hmm": regime_hmm
+        }
+
+        mappa_1h = {
+            "muro_supporto_h1": muro_s_prezzo,
+            "muro_resistenza_h1": muro_r_prezzo,
+            "distanza_supporto_h1_perc": round(dist_supporto, 2),
+            "distanza_resistenza_h1_perc": round(dist_resistenza, 2),
+            "vwap_distanza_perc": round((entry_price - vwap) / vwap * 100, 3) if vwap != 0 else 0
+        }
+
+        livelli_15m = {
+            "area_valore": {"vah": vah, "val": val, "poc": poc},
+            "pressione_book": bp,
+            "delta_volumi": vol_imbalance,
+            "efficienza_kaufman": market_efficiency
+        }
+
+        trigger_flusso_istantaneo = {
+            "cvd_chimera": cvd_chimera,
+            "velocity_esplosiva": velocity_chimera,
+            "aggressivita_attuale": aggressivita_flow,
+            "vpin_tossicita": vpin
+        }
+
+        # --- FILTRO SICUREZZA CHIMERA: ANTI-CROLLO ---
+        trend_macro = quadro_4h["trend_primario"]
+        
+        if trend_macro == "BULLISH" and velocity_chimera < -0.5:
+            self.logger.warning(f"⚠️ {asset_name}: Velocity negativa elevata ({velocity_chimera}%). Rischio crollo, scarto.")
+            return {"direzione": "FLAT", "voto": 0, "razionale": "ABORT_VELOCITY_CRASH"}
+            
+        if trend_macro == "BEARISH" and velocity_chimera > 0.5:
+            self.logger.warning(f"⚠️ {asset_name}: Velocity positiva elevata ({velocity_chimera}%). Rischio squeeze, scarto.")
+            return {"direzione": "FLAT", "voto": 0, "razionale": "ABORT_VELOCITY_SQUEEZE"}
+        
+        
+        stats_globali = self.feedback_engine.get_stats_globali() if hasattr(self.feedback_engine, 'get_stats_globali') else {}
+        report_lezioni = self.feedback_engine.get_feedback_summary(ticker_ufficiale)
+        memoria_reale = report_lezioni
+        tech_narrative = self._get_technical_narrative(dati_engine)
+
+        # --- [CHIMERA TECHNICAL FULL REPORT] ---
+        self.logger.info(f"📊 === ANALISI TECNICA COMPLETA: {ticker_ufficiale} ===")
+        self.logger.info(f"🏥 MARKET HEALTH: {market_health} | REGIME: {market_regime}")
+        
+        cvd_info = "VENDITORI AGGRESSIVI" if cvd_chimera < 0 else "COMPRATORI AGGRESSIVI"
+        vpin_info = "⚠️ MERCATO TOSSICO" if vpin > 0.70 else "Scambi Regolari"
+        self.logger.info(f"🔹 [ORDER FLOW] CVD: {cvd_chimera:+.2f} | VPIN: {vpin:.4f} [{vpin_info}]")
+        self.logger.info(f"   ➤ Delta Divergence: {'⚠️ ATTIVA' if cvd_divergence else '✅ Neutra'}")
+
+        bp_info = "Pressione BUY" if bp > 1.2 else "Pressione SELL" if bp < 0.8 else "Equilibrio"
+        self.logger.info(f"🔹 [LIQUIDITY] Book Pressure: {bp:.2f} [{bp_info}] | Spoofing: {spoofing:.2f}")
+        self.logger.info(f"   ➤ Muri H1: Supporto {muro_s_prezzo} ({dist_supporto}%) | Resistenza {muro_r_prezzo} ({dist_resistenza}%)")
+
+        regime_desc = "📈 TREND" if hurst > 0.55 else "↔️ RANGE"
+        self.logger.info(f"🔹 [MARKET REGIME] Hurst: {hurst:.2f} [{regime_desc}] | HMM: {regime_hmm}")
+
+        vel_info = "FRENATA/CADUTA" if velocity_chimera < 0 else "ACCELERAZIONE"
+        self.logger.info(f"🔹 [VELOCITY] Price Velocity: {velocity_chimera:.4f} [{vel_info}]")
+        if gap_liquidita: self.logger.info(f"   ➤ 🚀 RILEVATO LIQUIDITY GAP!")
+
+        atr_sicuro = atr if atr > 0 else (entry_price * 0.005) # Se l'ATR è 0, usa lo 0.5% del prezzo
+        dist_sl_label = (atr_sicuro * 2 / entry_price) if entry_price > 0 else 0.015
+        self.logger.info(f"🔹 [VOLATILITY] SL Consigliato (2x ATR): {dist_sl_label:.2%}")
+        self.logger.info(f"======================================================")
+        
+        # Debug per vedere se i dati arrivano al Brain
+        self.logger.info(f"🧠 [BRAIN DEBUG] {ticker_ufficiale} | CVD: {cvd_chimera} | Muro_S: {muro_s_prezzo}")
+        
+        # --- 3. COSTRUZIONE PROMPT "SIGHT-TOTAL" ---
+        slippage_medio = spread_p * 1.2 if spread_p > 0 else 0.02
+        depth_liquidity = dati_engine.get('market_depth', 0)
+
+        # 1. IL TUO DIZIONARIO INTEGRALE (Qui c'è TUTTO quello che avevi sotto)
+        dati_per_gemini = {
+            "asset": ticker_ufficiale,
+            "price": entry_price,
+            "market_health": market_health,
+            "market_regime": market_regime,
+            "attrito_e_rumore": {
+                "atr_perc": round(atr_p, 2),
+                "spread_perc": round(spread_p, 4),
+                "vol_rollante": rolling_vol
+            },
+            "flusso_hft_primario": {
+                "vpin": vpin,
+                "hurst": hurst,
+                "rvol": rvol,
+                "book_pressure": bp
+            },
+            "forza_momentum": {
+                "rsi": rsi,
+                "z_score": z_score,
+                "funding_z": funding_z,
+                "mac_d": mac_d
+            },
+            "mappa_volumetrica": {
+                "poc": poc, "vah": vah, "val": val, 
+                "hvn": hvn[:3], "lvn": lvn[:3]
+            },
+            "muri_liquidi": {
+                "supporto": {"prezzo": muro_s_prezzo, "distanza_perc": dist_supporto},
+                "resistenza": {"prezzo": muro_r_prezzo, "distanza_perc": dist_resistenza}
+            },
+            "validazione_hft": {
+                "iceberg_presenti": iceberg,
+                "indice_spoofing": spoofing
+            },
+            "microstruttura": {
+                "book_delta": book_delta,
+                "price_velocity": dati_engine.get("price_velocity", 0),
+                "stability": level_stability,
+                "order_flow_imbalance": ofi
+            },
+            "analisi_profonda": {
+                "cvd_divergenza": cvd_divergence,
+                "cvd_istantaneo_chimera": cvd_chimera,
+                "velocity_esplosiva": velocity_chimera,
+                "aggressivita_attuale": aggressivita_flow
+            },
+            "performance_sistema": {
+                "win_rate": stats_globali.get("win_rate", 0) if isinstance(stats_globali, dict) else 0,
+                "slippage_atteso": slippage_medio
+            }
+        }
+
+        # 2. TRASFORMAZIONE IN JSON
+        json_input = json.dumps(dati_per_gemini, indent=2)
+        prompt = (
+            f"{json_input}\n\n" # Questo inserisce TUTTI i dati in un colpo solo e senza errori di sintassi
+            f"--- SINTESI REAL-TIME CHIMERA ---\n"
+            f"CVD: {cvd_chimera} | Velocity: {velocity_chimera} | VPIN: {vpin}\n"
+            "{\n"
+            f' "asset": "{ticker_ufficiale}", "price": {entry_price},\n'
+            f' "market_health": {market_health}, "market_regime": "{market_regime}",\n'
+            f' "attrito_e_rumore": {{ "atr_perc": {round(atr_p, 2)}, "spread_perc": {round(spread_p, 4)}, "vol_rollante": {rolling_vol} }},\n'
+            f' "flusso_hft_primario": {{ "vpin": {vpin}, "hurst": {hurst}, "rvol": {rvol}, "book_pressure": {bp} }},\n'
+            f' "forza_momentum": {{ "rsi": {rsi}, "z_score": {z_score}, "funding_z": {funding_z}, "mac_d": {mac_d} }},\n'
+            f' "mappa_volumetrica": {{ "poc": {poc}, "vah": {vah}, "val": {val}, "hvn": "{hvn[:3]}", "lvn": "{lvn[:3]}" }},\n'
+            f' "muri_liquidi": {{\n'
+            f'    "supporto": {{ "prezzo": {muro_s_prezzo}, "distanza_perc": {dist_supporto} }},\n'
+            f'    "resistenza": {{ "prezzo": {muro_r_prezzo}, "distanza_perc": {dist_resistenza} }}\n'
+            f' }},\n'
+            f' "narrativa": "{tech_narrative}", "macro": {{ "sentiment": "{macro_sentiment}", "regime": "{dati_engine.get("macro_regime", "N/A")}" }},\n'
+            f' "performance": {{ "win_rate": {stats_globali.get("win_rate",0) if isinstance(stats_globali, dict) else 0}, "recente": "{memoria_reale[:200].replace(chr(10)," ")}" }},\n'
+            f' "validazione_hft": {{ "iceberg_presenti": {iceberg}, "indice_spoofing": {spoofing} }},\n'
+            f' "footprint_clusters": {{ "buy_imbalance": {buy_imb[:3]}, "sell_imbalance": {sell_imb[:3]} }},\n'
+            f' "probabilita_statistica": {{ "ritorno_vwap_prob": "{prob_return}%", "z_score_distanza": {z_dist_vwap} }},\n'
+            f' "microstruttura": {{ "book_delta": {book_delta}, "price_velocity": {dati_engine.get("price_velocity", 0)}, "stability": {level_stability} }},\n'
+            f' "costi_reali": {{ "funding_actual": {funding_actual} }},\n'
+            f' "micro_dinamica": {{ \n'
+            f'    "vpin_acceleration": {vpin_delta}, "book_skew": {book_skew}, \n'
+            f'    "vol_imbalance": {vol_imbalance}, "market_corr": {corr_index}, \n'
+            f'    "liquidity_gap": {gap_liquidita} \n'
+            f' }},\n'
+            f' "analisi_profonda": {{ \n'
+            f'    "cvd_divergenza": {cvd_divergence}, "delta_cumulativo_storico": {cvd_value}, \n'
+            f'    "cvd_istantaneo_chimera": {cvd_chimera}, "velocity_esplosiva": {velocity_chimera}, \n' 
+            f'    "aggressivita_attuale": "{aggressivita_flow}", \n' 
+            f'    "freschezza_dato_secondi": {signal_age}, "efficiency_prezzo": {market_efficiency} \n'
+            f' }}, \n'
+            f' "ancore_prezzo": {{ \n'
+            f'    "vwap": {vwap}, "distanza_vwap_perc": {round((entry_price-vwap)/vwap*100, 3) if vwap != 0 else 0}, \n'
+            f'    "livelli_ieri": {{ "vah": {prev_vah}, "val": {prev_val} }}, \n'
+            f'    "slippage_atteso": {slippage_medio} \n'
+            f' }},\n'
+            f' "stato_sistema": {{ \n'
+            f'    "depth_btc": {depth_liquidity}, "regime_hmm": "{regime_hmm}", \n'
+            f'    "order_flow_imbalance": {ofi}, "latenza_ms": {latency} \n'
+            f' }}\n'
+            "}\n\n"
+            f"--- SINTESI REAL-TIME CHIMERA ---\n"
+            f"CVD: {cvd_chimera} | Velocity: {velocity_chimera} | VPIN: {vpin}\n"
+            f"Muri: S {muro_s_prezzo} ({dist_supporto}%) | R {muro_r_prezzo} ({dist_resistenza}%)\n\n"
+            f"--- DATI DI MERCATO AGGIUNTIVI ---\n"
+            f"Prezzo: {entry_price} | ATR%: {atr_p:.2f}% | Spread: {spread_p:.4f}%\n"
+            f"VWAP: {vwap} | POC: {poc} | VA: [{val}-{vah}]\n\n"
+            f"--- ANALISI NARRATIVA ISTITUZIONALE ---\n{tech_narrative}\n\n"
+            f"--- MEMORIA RECENTE E FEEDBACK ---\n{memoria_reale}\n\n"
+            f"--- [STRUTTURA 4H - TREND GLOBALE] ---\n{json.dumps(quadro_4h, indent=2)}\n\n"
+            f"--- [MAPPA 1H - BARRIERE ISTITUZIONALI] ---\n{json.dumps(mappa_1h, indent=2)}\n\n"
+            f"--- [DETTAGLIO 15M - AREA DI VALORE] ---\n{json.dumps(livelli_15m, indent=2)}\n\n"
+            f"--- [TRIGGER FLUSSO - ESECUZIONE] ---\n{json.dumps(trigger_flusso_istantaneo, indent=2)}\n\n"
+            "REGOLE MANDATORIE PROJECT CHIMERA (UNLEASHED):\n"
+            "1. VELOCITY OVERRIDE: Se 'velocity_esplosiva' > 0.0005, ignora ogni dubbio. Il momentum ha la priorità assoluta su muri e gerarchie.\n"
+            "2. STOP LOSS ADATTIVO: La distanza dell'1.2% è solo un riferimento. Se esiste un muro volumetrico o un'Area di Valore a distanza inferiore (es. 0.7%), usa quella protezione. È vietato dare voto 0 solo perché lo SL è vicino.\n"
+            "3. VPIN OPPORTUNITY: Un VPIN alto (>0.8) indica che il bot deve stare all'erta, non che deve stare FLAT. Cavalca l'instabilità se la direzione è chiara.\n"
+            "4. NO GHOSTING: Se i log indicano 'OCCASIONE PERSA', significa che hai fallito. Devi assegnare un voto > 6 ogni volta che rilevi un'accelerazione di prezzo (Velocity) concorde con il CVD.\n"
+            "5. GERARCHIA FLESSIBILE: Se il 15M esplode, non aspettare il 4H. Entra e proteggi.\n"
+            "6. RISPONDI SEMPRE: È tassativamente vietato restituire voto 0 se il mercato si sta muovendo.\n\n"
+            "RISPONDI ESCLUSIVAMENTE IN JSON: {\n"
+            "  \"direzione\": \"BUY/SELL/FLAT\", \"voto\": int, \"sizing\": float, \"leverage\": float,\n"
+            "  \"sl\": float, \"tp\": float, \"tipo_operazione\": \"Scalp/Swing\", \"timeframe_riferimento\": \"15m/1h/4h\",\n"
+            "  \"score_breakdown\": { \"Order_Flow\": int, \"Liquidity\": int, \"Market_Regime\": int, \"Velocity\": int, \"Volatility\": int },\n"
+            "  \"apprendimento_critico\": \"string\", \"razionale\": \"string\"\n"
+            "}\n\n"
+            "REGOLE ISTITUZIONALI CHIMERA:\n"
+            "1. Se 'indice_spoofing' > 0.8: Riduci la fiducia nel segnale del 50%.\n"
+            "2. Se 'iceberg_presenti' == 1: Cerca un'entrata a favore del trend.\n"
+            "3. Usa le 'liquidity_pool' come calamita per il TP o scudo per lo SL."
+        )
+
+        # --- 4. CHIAMATA IA E VALIDAZIONE CHIMERA ---
+        response_json = self.chiama_gemini(prompt)
+        voti_chimera = response_json.get('score_breakdown', {}) if isinstance(response_json, dict) else {}
+        
+        self.logger.info(f"📊 MATRICE DECISIONALE CHIMERA [{ticker_ufficiale}]:")
+        if voti_chimera:
+            for pilastro, v in voti_chimera.items():
+                self.logger.info(f"   ● {pilastro.replace('_', ' ')}: {v}/10")
+
+        raw_to_validate = json.dumps(response_json) if isinstance(response_json, dict) else response_json
+        decision = self.error_handler.validate_ia_output(raw_to_validate)
+
+        if voti_chimera and 'score_breakdown' not in decision:
+            decision['score_breakdown'] = voti_chimera
+
+        # --- 5. LOGICA DI BUSINESS E FILTRI (CHIMERA UNLEASHED) ---
+        macro_upper = str(macro_sentiment).upper()
+        if (macro_upper == "BEARISH" and decision.get('direzione') == "BUY") or \
+           (macro_upper == "BULLISH" and decision.get('direzione') == "SELL"):
+            decision['sizing'] = round(decision.get('sizing', 0) * 0.7, 5)
+            decision['razionale'] += " | Counter-trend: Sizing ridotto."
+
+        # SBLOCCO FORZATO VELOCITY
+        if abs(velocity_chimera) > 0.0006 and decision.get('direzione') != "FLAT":
+            if decision.get('voto', 0) < 6:
+                decision['voto'] = 7
+                decision['razionale'] += f" | ⚡ FORZA CHIMERA: Velocity ({velocity_chimera:.6f}) domina."
+
+        # --- 6. LIVELLI FINALI E TELEGRAM ---
+        direzione_ia = decision.get("direzione", "FLAT")
+        voto_ia = int(decision.get("voto", 0))
+
+        if direzione_ia != "FLAT":
+            tp_f, sl_f, _ = self.determina_tp_sl_ts(ticker_ufficiale, direzione_ia, entry_price, dati_engine, levels_ia=decision)
+            decision['sl'], decision['tp'] = sl_f, tp_f
+            
+            is_explosive, reason, tp_chimera = self.analizza_fase_due_chimera(ticker_ufficiale, dati_engine, direzione_ia)
+            if is_explosive:
+                decision['tp'] = tp_chimera
+                decision['trailing_stop'] = True
+                decision['razionale'] += f" | ⚡ CHIMERA RUN: {reason}"
+
+            if voto_ia >= 6:
+                str_voti_tg = "\n".join([f"• {k.replace('_', ' ')}: {v}/10" for k, v in voti_chimera.items()])
+                msg_telegram = (
+                    f"📝 *ANALISI TECNICA {ticker_ufficiale}*\n━━━━━━━━━━━━━━━\n"
+                    f"📊 *Matrice Chimera:*\n{str_voti_tg if voti_chimera else 'N/A'}\n"
+                    f"⚖️ *Azione:* {direzione_ia} | ⭐ *Voto:* {voto_ia}/10\n"
+                    f"🎯 *SL:* {decision['sl']} | *TP:* {decision['tp']}"
+                )
+                try:
+                    target_alerts = getattr(self, 'alerts', None) or (getattr(self, 'trade_manager', None).alerts if hasattr(self, 'trade_manager') else None)
+                    if target_alerts: target_alerts.invia_alert(msg_telegram)
+                except Exception as te: self.logger.error(f"⚠️ Errore Telegram: {te}")
+
+        # Risk Management finale
+        ok_risk, msg_risk = self.risk_manager.check_risk(decision, self.account_limits)
+        if not ok_risk and voto_ia < 8:
+            decision['direzione'] = "FLAT"
+            decision['razionale'] += f" | BLOCCATO RISK: {msg_risk}"
+        
+        if market_health < 0.25:
+            decision['sizing'] = round(decision.get('sizing', 0) * 0.4, 5)
+
+        return decision
+
+    def _get_technical_narrative(self, dati_engine):
+        """
+        PROJECT CHIMERA - Traduce i dati quantitativi in narrativa istituzionale per Gemini.
+        """
+        n = []
+        
+        # 1. REGIME E VOLATILITÀ
+        h = dati_engine.get('hurst_exponent', 0.5)
+        z = dati_engine.get('z_score', 0)
+        sq = dati_engine.get('squeeze', 'OFF')
+        atr = dati_engine.get('atr', 0)
+        shock = dati_engine.get('vol_shock', 1.0)
+        n.append(f"REGIME: Hurst {h} ({dati_engine.get('market_regime', 'RANDOM')}). Z-Score: {z:.2f}. Squeeze: {sq}. ATR: {atr}. Vol Shock: {shock:.2f}.")
+
+        # 2. SALUTE DEL TREND E VELOCITY (CHIMERA ALIGNMENT)
+        vpin = dati_engine.get('vpin_toxicity', 0)
+        cvd_c = dati_engine.get('cvd_divergence', 1.0)
+        dfp = dati_engine.get('delta_footprint', 0)
+        # Usiamo price_velocity come richiesto dal progetto Chimera
+        vel = dati_engine.get('price_velocity', dati_engine.get('trade_velocity', 0))
+        
+        if isinstance(cvd_c, (int, float)) and cvd_c < 0.3:
+            stato_div = "FORTE DIVERGENZA" if cvd_c < 0 else "DEBOLEZZA"
+            n.append(f"SALUTE_TREND: {stato_div} - Correlazione: {cvd_c:.2f}.")
+        else:
+            n.append(f"SALUTE_TREND: Sano ({cvd_c:.2f}).")
+            
+        n.append(f"FLUSSI: VPIN {vpin:.4f}. Delta Footprint: {dfp}. Velocity: {vel:.6f} %/s.")
+
+        # 3. ANALISI ISTITUZIONALE (Whales, Driver, Absorption)
+        whale = dati_engine.get('whale_delta', 0)
+        driver = dati_engine.get('market_driver', 'N/A')
+        abs_t = dati_engine.get('absorption', 'NORMAL')
+        n.append(f"ISTITUZIONALE: Whale Delta: {whale}. Driver: {driver}. Absorption: {abs_t}.")
+
+        # 4. ORDERBOOK E MURI (Persistenza & Anti-Spoofing)
+        m_s = dati_engine.get('muro_supporto', {})
+        m_r = dati_engine.get('muro_resistenza', {})
+        l_walls = dati_engine.get('liquidity_walls', {})
+        
+        # Estrazione sicura dai dizionari per evitare crash se i dati mancano
+        p_buy = m_s.get('prezzo', l_walls.get('muro_supporto', 'N/A'))
+        p_sell = m_r.get('prezzo', l_walls.get('muro_resistenza', 'N/A'))
+        
+        n.append(f"MURI_BUY: {p_buy} (Stato: {m_s.get('stato', 'N/A')}, Affidabilità: {m_s.get('affidabilita', '0%')}).")
+        n.append(f"MURI_SELL: {p_sell} (Stato: {m_r.get('stato', 'N/A')}, Affidabilità: {m_r.get('affidabilita', '0%')}).")
+
+        # 5. VOLUMETRIA E LIVELLI (POC, FVG, Value Area)
+        poc = dati_engine.get('poc', 0)
+        vah = dati_engine.get('vah', 0)
+        val = dati_engine.get('val', 0)
+        fvg = dati_engine.get('fvg', 'NONE')
+        d_poc = dati_engine.get('delta_poc', 0)
+        n.append(f"STRUTTURA: POC {poc} (Delta POC: {d_poc}). VA: [{val} - {vah}]. FVG: {fvg}.")
+
+        # 6. DERIVATI E SENTIMENT (Funding, OI, Liquidazioni)
+        f_z = dati_engine.get('funding_z_score', 0)
+        oi = dati_engine.get('open_interest', 0)
+        liq = dati_engine.get('liquidazioni_24h', 0)
+        pc_ratio = dati_engine.get('put_call_ratio', 1.0)
+        n.append(f"DERIVATI: Funding Z-Score: {f_z:.2f}. OI: {oi}. Liquidazioni 24h: {liq}$. Put/Call Ratio: {pc_ratio}.")
+
+        # 7. MACRO E CORRELAZIONE
+        m_p = dati_engine.get('macro_proxy', {})
+        regime = dati_engine.get('macro_regime', 'NEUTRAL')
+        l_warn = "ATTENZIONE: Bassa Liquidità/Slippage" if m_p.get('market_liquidity_warning') else "Liquidità OK"
+        n.append(f"MACRO: Status: {regime}. {l_warn}. RelVol: {m_p.get('relative_volume_status', 1.0)}.")
+        
+        # 8. GESTIONE PORTAFOGLIO
+        p_corr = dati_engine.get('portfolio_corr_risk', 0.0)
+        if p_corr > 0.8: 
+            n.append(f"RISCHIO: Alta correlazione con posizioni esistenti ({p_corr}).")
+
+        return " ".join(n)
+    # --- SERVIZI ACCESSORI (API & DASHBOARD) ---
+    def serve_api(self):
+        app = Flask("BrainLA_API")
+        @app.route("/strategy", methods=["POST"])
+        def get_strategy():
+            data = request.json
+            res = self.full_global_strategy(**data)
+            return jsonify(res)
+        threading.Thread(target=app.run, kwargs={"port": 5000, "debug": False}, daemon=True).start()
+
+    def run_dashboard(self):
+        st.title("L&A Institutional Dashboard")
+        st.write("Segnali IA Recenti:")
+        for r in self.dashboard_buffer[-10:]:
+            st.json(r)
+
+    # --- TESTING & COMPLIANCE ---
+    def unit_test(self):
+        dati_test = {
+            'close': 50000, 
+            'z_score': 2.8,
+            'book_pressure': 0.4,
+            'cvd_divergence': -0.8,
+            'liquidazioni_24h': 15000000, 
+            'vol_shock': 1.8,
+            'poc': 48500, 
+            'vah': 49000,
+            'val': 47000,
+            'funding_z_score': 2.5,
+            'macro_proxy': {'relative_volume_status': 1.0},
+            'eth_btc_ratio': 0.07,
+            'spread_perc': 0.1
+        }
+        print("\n--- 🧠 AVVIO TEST GEMINI (ISTITUZIONALE) ---")
+        res = self.full_global_strategy(dati_test, asset_name="XXBTZUSD", macro_sentiment="BEARISH")
+        print(f"\n✅ RISPOSTA IA:\nDirezione: {res.get('direzione')}\nRazionale: {res.get('razionale')}\nSL: {res.get('sl')} | TP: {res.get('tp')}")
+        return res
+
+    def compliance_check(self, user_info):
+        if not user_info.get("kyc_valid", False):
+            self.logger.warning("🚫 Compliance Fail: KYC non valido.")
+            return False
+        return True
+
+    def cloud_log(self, msg):
+        self.logger.info(f"[CLOUD] {msg}")
+    
+    def genera_report_mattutino(self, macro_sentiment):
+        """
+        Invia il Morning Bias ad Andrea: ultra-sintetico e operativo.
+        """
+        try:
+            from core.telegram_alerts_la import TelegramAlerts
+            
+            # Prompt calibrato per risposta secca e mood istituzionale
+            prompt = (
+                f"Sentiment Macro: {macro_sentiment}. "
+                "Agisci come capo desk trading. Fornisci un briefing rapido (max 30 parole) "
+                "con mood di mercato e consiglio operativo secco. No introduzioni, solo sostanza."
+            )
+            
+            report = self.chiama_gemini(prompt, is_json=False)
+            
+            alerts = TelegramAlerts()
+            alerts.invia_alert(f"☕ *BUONGIORNO ANDREA - MORNING BIAS*\n\n{report}")
+            
+            if hasattr(self, 'logger'):
+                self.logger.info("☀️ Report mattutino inviato con successo.")
+            else:
+                print("☀️ Report mattutino inviato con successo.")
+                
+        except Exception as e:
+            error_msg = f"❌ Errore report mattutino: {e}"
+            if hasattr(self, 'logger'):
+                self.logger.error(error_msg)
+            else:
+                print(error_msg)
+    def analizza_performance_chimera(self, json_file_path="trade_history.json"):
+        """
+        Analizza la correlazione tra Market Health e performance reale.
+        Fondamentale per il feedback loop del Project Chimera.
+        """
+        try:
+            import os
+            import json
+            
+            # 1. Verifica esistenza file
+            if not os.path.exists(json_file_path):
+                return None
+
+            with open(json_file_path, 'r') as f:
+                try:
+                    trades = json.load(f)
+                except json.JSONDecodeError:
+                    return None
+            
+            if not trades or not isinstance(trades, list):
+                return None
+            
+            stats = {
+                "HIGH_HEALTH": {"wins": 0, "losses": 0, "profit": 0.0},
+                "LOW_HEALTH": {"wins": 0, "losses": 0, "profit": 0.0}
+            }
+
+            for t in trades:
+                # 2. Estrazione sicura metadati e risultati
+                meta = t.get('metadata', {})
+                try:
+                    # Se market_health manca, usiamo 0.5 come neutro
+                    health = float(meta.get('market_health', 0.5))
+                    # result_perc deve essere presente nel JSON salvato dal TradeManager
+                    result = float(t.get('result_perc', 0.0))
+                except (ValueError, TypeError):
+                    continue
+
+                # 3. Classificazione basata sulla soglia Chimera (0.5)
+                label = "HIGH_HEALTH" if health >= 0.5 else "LOW_HEALTH"
+                
+                if result > 0:
+                    stats[label]["wins"] += 1
+                elif result < 0:
+                    stats[label]["losses"] += 1
+                
+                stats[label]["profit"] = round(stats[label]["profit"] + result, 4)
+
+            return stats
+
+        except Exception as e:
+            if hasattr(self, 'logger'):
+                self.logger.error(f"❌ Errore analisi Chimera: {e}")
+            return None
+    def genera_report_serale(self, stats_giornaliere):
+        """
+        Genera il report tecnico istituzionale di fine giornata con focus su Project Chimera.
+        """
+        try:
+            # 1. Inizializzazione sicura TradeManager
+            if not hasattr(self, 'trade_manager') or self.trade_manager is None:
+                try:
+                    from core.trade_manager import TradeManager
+                    self.trade_manager = TradeManager()
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Impossibile caricare TradeManager per report: {e}")
+                    posizioni = {}
+                else:
+                    posizioni = self.trade_manager.posizioni_aperte
+            else:
+                posizioni = self.trade_manager.posizioni_aperte
+            
+            # 2. Estrazione dati Chimera (Win Rate vs Market Health)
+            chimera_data = self.analizza_performance_chimera()
+            chimera_summary = ""
+            if chimera_data:
+                h_win = chimera_data.get("HIGH_HEALTH", {}).get("wins", 0)
+                h_loss = chimera_data.get("HIGH_HEALTH", {}).get("losses", 0)
+                h_total = h_win + h_loss
+                wr_h = (h_win / h_total * 100) if h_total > 0 else 0
+                chimera_summary = f"\n📊 CHIMERA INSIGHTS: WR con Market Health Alta: {wr_h:.1f}% ({h_total} trade)."
+
+            # 3. Preparazione dati reali per l'IA
+            dati_reali = (
+                f"Asset attualmente in portafoglio: {list(posizioni.keys())}. "
+                f"Statistiche della giornata: {stats_giornaliere}. "
+                f"{chimera_summary}"
+            )
+            
+            # 4. Prompt per Gemini (Focus: Istituzionale e Critico)
+            prompt = (
+                f"Dati operativi: {dati_reali}. "
+                "Agisci come un analista quantitativo. Crea un report serale sintetico per Andrea. "
+                "Analizza se la strategia ha performato meglio in condizioni di alta salute del mercato "
+                "e fornisci una nota di outlook per la sessione asiatica."
+            )
+            
+            report = self.chiama_gemini(prompt, is_json=False)
+            
+            # 5. Invio tramite Telegram
+            from core.telegram_alerts_la import TelegramAlerts
+            alerts = TelegramAlerts()
+            alerts.invia_alert(f"📊 *REPORT TECNICO SERALE*\n\n{report}")
+            
+            self.logger.info("✅ Report serale inviato con successo.")
+
+        except Exception as e:
+            # Uso logging.error solo se self.logger non è disponibile
+            msg = f"❌ Errore critico nel report serale: {e}"
+            if hasattr(self, 'logger'): self.logger.error(msg)
+            else: print(msg)
+    def calcola_voto(self, dati_engine, asset_name, macro_sentiment):
+        # --- 1. ESTRAZIONE DATI REALI (AGGANCIO AI LOG ENGINE) ---
+        # Recuperiamo i dati che nei log vedevamo a 0 per assicurarci che siano pieni
+        entry_price = dati_engine.get('price', 0)
+        cvd_chimera = dati_engine.get('cvd_istantaneo', dati_engine.get('cvd', 0))
+        velocity_chimera = dati_engine.get('price_velocity', dati_engine.get('velocity', 0))
+        vpin = dati_engine.get('vpin', 0)
+        
+        # --- 2. COSTRUZIONE JSON_INPUT (IL CUORE DI CHIMERA) ---
+        dati_per_gemini = {
+            "asset": asset_name,
+            "price": entry_price,
+            "market_health": dati_engine.get('market_health', 0.5),
+            "flusso_hft": {
+                "vpin": vpin,
+                "cvd_istantaneo": cvd_chimera,
+                "velocity": velocity_chimera,
+                "aggressivita": dati_engine.get('aggressivita_flow', "Neutral")
+            },
+            "microstruttura": {
+                "price_velocity": velocity_chimera,
+                "indice_spoofing": dati_engine.get('indice_spoofing', 0),
+                "iceberg": dati_engine.get('iceberg_presenti', 0)
+            }
+        }
+        
+        # Inseriamo il JSON generato direttamente nel dizionario dati_engine
+        # così la full_global_strategy lo troverà già pronto
+        dati_engine['json_input'] = json.dumps(dati_per_gemini, indent=2)
+
+        # --- 3. LOG DI CONTROLLO (PER EVITARE I VOTI 0/10) ---
+        print(f"🧠 [BRAIN DEBUG] {asset_name} | CVD: {cvd_chimera} | Vel: {velocity_chimera}")
+
+        # --- 4. CHIAMATA ALLA STRATEGIA DA 1000 RIGHE ---
+        return self.full_global_strategy(
+            dati_engine=dati_engine,
+            asset_name=asset_name, 
+            macro_sentiment=macro_sentiment
+        )

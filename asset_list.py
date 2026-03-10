@@ -1,50 +1,79 @@
-# --- DEFINISCI GLI ASSET SPOT E FUTURES ---
-SPOT = [
-    'XXBTZUSD',
-    'XETHZUSD'
-    # altri spot se servono...
-]
+# -*- coding: utf-8 -*-
+"""
+L&A Institutional Bot - AssetList
+FIX: Implementazione mapping Futures e correzione Ticker per EngineLA.
+"""
 
-#FUTURES = [
-    #'BTC/USD:BTC',
-    #'ETH/USD:ETH'
-# --- CONFIGURAZIONE ASSET ---
+ASSET_PRINCIPALI = ["XXBTZUSD", "XETHZUSD", "XETHXXBT"]
 
-SPOT = [
-    'XXBTZUSD',
-    'XETHZUSD'
-]
-
-# Invece di commentare la riga, la rendiamo una lista vuota
-# Così il bot non dà errore "NameError" ma non analizza nulla qui dentro
-FUTURES = [] 
-
-# Ora questa riga non darà più errore perché FUTURES esiste (è vuota)
-ATTIVI = SPOT #+ FUTURES
-
+# Mapping per CCXT e chiamate API dirette
 ASSET_MAPPING = {
-    # Mapping spot
-    'XXBTZUSD':      'XXBTZUSD',
-    'XETHZUSD':      'XETHZUSD',
-    
-    # Se vuoi aggiungere i futures in futuro, toglierai i # qui sotto
-    # 'BTCPERP':       'BTC/USD:BTC',
-    # 'ETHPERP':       'ETH/USD:ETH'
+    "XXBTZUSD": "BTC/USD",
+    "XETHZUSD": "ETH/USD",
+    "XETHXXBT": "ETH/BTC"
 }
 
-def get_trading_ticker_and_type(coin):
-    # Prende il ticker reale dal mapping, se non esiste usa il nome originale
-    trading_ticker = ASSET_MAPPING.get(coin, coin)
+# Mapping specifico per i Futures di Kraken (necessario per Funding/OI)
+FUTURES_MAPPING = {
+    "XXBTZUSD": "PI_XBTUSD",
+    "XETHZUSD": "PI_ETHUSD",
+    "XETHXXBT": "FI_ETHUSD" # Il cross non ha un future diretto, usiamo ETH come proxy
+}
+
+ASSET_CONFIG = {
+    "XXBTZUSD": {
+        "precision": 1,
+        "vol_precision": 8,
+        "min_size": 0.0001,
+        "max_leverage": 5,
+        "is_cross": False
+    },
+    "XETHZUSD": {
+        "precision": 2,
+        "vol_precision": 2,
+        "min_size": 0.01,
+        "max_leverage": 5,
+        "is_cross": False
+    },
+    "XETHXXBT": {
+        "ticker": "ETH/BTC",
+        "precision": 5,
+        "vol_precision": 4,
+        "min_size": 0.01,
+        "max_leverage": 1, # Spesso leva non disponibile su cross crypto-crypto
+        "is_cross": True,
+        "quote_asset": "XXBTZUSD"
+    }
+}
+
+def is_asset_supported(asset_name):
+    return asset_name.upper() in ASSET_MAPPING or asset_name.upper() in ASSET_PRINCIPALI
+
+def get_ticker(asset_name):
+    """
+    Trasforma nomi umani in codici Kraken (es. BTC/USD -> XXBTZUSD)
+    o viceversa, assicurando compatibilità totale con l'Engine.
+    """
+    name_upper = asset_name.upper()
     
-    # Determina se è futures o spot (restituisce True o False)
-    # Usiamo una lista vuota di backup se FUTURES o SPOT non fossero definiti
-    is_futures = trading_ticker in (FUTURES if 'FUTURES' in locals() or 'FUTURES' in globals() else [])
-    is_spot = trading_ticker in (SPOT if 'SPOT' in locals() or 'SPOT' in globals() else [])
-    
-    # RESTITUISCE ESATTAMENTE 3 VALORI
-    return trading_ticker, is_futures, is_spot
-# --- TEST ---
-if __name__ == "__main__":
-    for asset in ATTIVI:
-        t, f, s = get_trading_ticker_and_type(asset)
-        print(f"Asset: {asset} | Ticker: {t} | Futures: {f} | Spot: {s}")
+    # Caso 1: È già una chiave (es. XXBTZUSD), la restituiamo
+    if name_upper in ASSET_MAPPING:
+        return name_upper
+        
+    # Caso 2: È un valore (es. BTC/USD), cerchiamo la chiave corrispondente
+    for kraken_code, human_name in ASSET_MAPPING.items():
+        if human_name.upper() == name_upper:
+            return kraken_code
+            
+    # Caso 3: Non è nel mapping, restituiamo l'originale
+    return name_upper
+def get_futures_ticker(asset_name):
+    """Restituisce il ticker per le API Futures di Kraken."""
+    return FUTURES_MAPPING.get(asset_name.upper())
+
+def get_config(asset_name):
+    """Ritorna la configurazione completa dell'asset."""
+    return ASSET_CONFIG.get(asset_name.upper(), {})
+
+def filtra_asset_istituzionali(lista_asset):
+    return [a for a in lista_asset if a in ASSET_PRINCIPALI]

@@ -1,209 +1,282 @@
 # -*- coding: utf-8 -*-
-# performer_la.py - ORDER EXECUTION ENGINE v3.8 MARGIN ENABLED
-# Versione integrale senza tagli.
-# Integrazione: Margin Trading (Leva) per SHORT reale, Protezione Futures e Notifiche.
+"""
+L&A Institutional Bot - PerformerLA
+Versione 3.0: CHIMERA INTEGRATION & DYNAMIC PRECISION
+"""
 
 import logging
+import ccxt
 import time
-import traceback
-from config_auto_apprendimento import GEMINI_MODEL
+from datetime import datetime
+from core import asset_list
+from core import config_la
 
 class PerformerLA:
-    """
-    Esegue gli ordini su Kraken: apertura, chiusura, aggiornamento SL/TP.
-    Gestisce il Margin Trading per permettere posizioni SHORT su asset SPOT.
-    """
-    
-    def __init__(self, exchange, live_mode=False, telegram_bot=None):
-        """
-        Args:
-            exchange: istanza CCXT di Kraken
-            live_mode: True = ordini reali, False = simulazione
-            telegram_bot: istanza del bot per inviare notifiche (opzionale)
-        """
-        self.exchange = exchange
-        self.live_mode = live_mode
-        self.telegram_bot = telegram_bot
-        self.posizioni_simulate = {}  # Per tracking in simulazione
-        self.force_futures_simulation = True # Sicurezza per ticker derivati
+    def __init__(self, exchange_id=None):
+        exchange_id = exchange_id or 'kraken'
+        self.exchange = getattr(ccxt, exchange_id)({
+            'apiKey': config_la.KRAKEN_KEY,
+            'secret': config_la.KRAKEN_SECRET,
+            'enableRateLimit': True,
+            'timeout': 30000,
+            'options': {'defaultType': 'spot'}
+        })
+        self.logger = logging.getLogger("PerformerLA")
+        # Questo dizionario manterrà gli ID finché il bot è acceso
+        self.ordini_attivi = {}
         
-        # IMPOSTAZIONE LEVA (Margin Trading)
-        # Necessaria per aprire posizioni SHORT su Kraken Spot (es. XXBTZUSD)
-        self.leverage_value = 2 
-        
-        modo = "LIVE" if live_mode else "SIMULAZIONE"
-        logging.info(f"🚀 PerformerLA inizializzato in {modo} (Leva Margin: {self.leverage_value}x)")
-
-    # ========================================================================
-    # UTILITY INTERNE E VALIDAZIONI
-    # ========================================================================
+    def get_order_ids_from_memory(self, asset):
+        """ Recupera gli ID salvati senza interrogare Kraken inutilmente """
+        dati = self.ordini_attivi.get(asset, {})
+        id_sl = dati.get('sl_id') 
+        id_tp = dati.get('tp_id')
+        self.logger.info(f"🔍 Recuperato ID SL REALE per {asset}: {id_sl}")
+        self.logger.info(f"🔍 Recuperato ID TP REALE per {asset}: {id_tp}")
+        return id_sl, id_tp
     
-    def _is_future(self, symbol):
-        """Rileva se un ticker appartiene ai Futures di Kraken (es. BTC/USD:BTC)"""
-        return ":" in symbol or "PI_" in symbol or "FI_" in symbol
-
-    def _invia_notifica(self, messaggio):
-        """Invia una notifica Telegram se il bot è configurato"""
-        logging.info(messaggio)
-        if self.telegram_bot:
-            try:
-                self.telegram_bot.invia_messaggio(messaggio) 
-            except Exception as e:
-                logging.error(f"Errore invio notifica Telegram: {e}")
-
-    def _valida_parametri(self, symbol, prezzo, size, sl=None):
-        """Valida i parametri prima di eseguire l'ordine, gestendo eventuali tuple"""
+    def cancella_ordine_specifico(self, order_id):
+        """ 
+        VERSIONE MASTER CHIMERA:
+        Risolto errore str vs int e aggiunta resilienza per ordini già chiusi o pending.
+        """
+        if not order_id: return False
         try:
-            if isinstance(prezzo, tuple): prezzo = prezzo[0]
-            if isinstance(size, tuple): size = size[0]
-            if sl is not None and isinstance(sl, tuple): sl = sl[0]
+            # 1. Chiamata diretta all'endpoint di Kraken
+            res = self.exchange.private_post_cancelorder({'txid': order_id})
+            
+            # 2. Verifica reale con cast a intero
+            if res and 'result' in res:
+                # Se lo stato è pending, la richiesta è stata accettata
+                if res['result'].get('status') == 'pending':
+                    self.logger.info(f"⏳ Ordine {order_id} in cancellazione (pending)...")
+                    return True
 
-            if not symbol or not isinstance(symbol, str):
-                logging.error(f"Symbol invalido: {symbol}")
-                return False
+                count = int(res['result'].get('count', 0))
+                if count > 0:
+                    self.logger.info(f"✅ Ordine {order_id} rimosso con successo.")
+                    return True
             
-            if prezzo is not None and prezzo <= 0:
-                logging.error(f"Prezzo invalido: {prezzo}")
-                return False
-            
-            if size is not None and size <= 0:
-                logging.error(f"Size invalida: {size}")
-                return False
-            
-            return True
-        except Exception as e:
-            logging.error(f"Errore validazione parametri: {e}")
+            self.logger.warning(f"⚠️ Ordine {order_id} non rimosso (count 0).")
             return False
+            
+        except Exception as e:
+            # --- LOGICA DI RESILIENZA CHIMERA ---
+            # Se l'ordine è già stato eseguito o cancellato, il risultato per noi è SUCCESS
+            msg_errore = str(e).lower()
+            if "invalid order" in msg_errore or "already closed" in msg_errore:
+                self.logger.info(f"ℹ️ Ordine {order_id} già chiuso o inesistente. Procedo.")
+                return True
 
-    def _retry_kraken(self, funzione, max_tentativi=3, delay=2):
-        """Riprova una operazione Kraken con backoff in caso di errore di rete"""
-        for tentativo in range(max_tentativi):
-            try:
-                return funzione()
-            except Exception as e:
-                if tentativo < max_tentativi - 1:
-                    logging.warning(f"Errore Kraken (tentativo {tentativo+1}/{max_tentativi}): {e}")
-                    time.sleep(delay * (tentativo + 1))
-                else:
-                    logging.error(f"Errore Kraken definitivo dopo {max_tentativi} tentativi: {e}")
-                    return None
-
-    # ========================================================================
-    # APERTURA POSIZIONI
-    # ========================================================================
-    
-    def apri_posizione_market(self, symbol, direzione, size, voto_ia, modalita='SPOT', exchange=None):
-        """Apre una posizione market. Utilizza il MARGINE per permettere lo SHORT."""
-        target_ex = exchange if exchange else self.exchange
-        
+            self.logger.warning(f"⚠️ Impossibile cancellare l'ordine {order_id}: {e}")
+            return False
+            
+    def qprice(self, symbol, p):
+        """ 
+        Formattatore prezzi dinamico Chimera. 
+        Recupera la precisione reale dal mercato per evitare 'Invalid Price'.
+        """
+        if not p: return None
         try:
-            if isinstance(size, tuple): size = size[0]
-            if isinstance(voto_ia, tuple): voto_ia = voto_ia[0]
+            # Carichiamo i mercati se non presenti per avere le precisioni aggiornate
+            if not self.exchange.markets:
+                self.exchange.load_markets()
             
-            is_f = self._is_future(symbol)
+            # Se l'asset è in asset_list, usiamo il ticker ufficiale
+            symbol_ufficiale = asset_list.get_ticker(symbol)
+            return self.exchange.price_to_precision(symbol_ufficiale, float(p))
+        except:
+            # Fallback manuale se il caricamento mercati fallisce
+            if "XBT" in symbol or "BTC" in symbol: return f"{float(p):.1f}"
+            if "ETH" in symbol: return f"{float(p):.2f}"
+            return str(p)
+
+    def get_current_price(self, asset):
+        """ Recupera l'ultimo prezzo di mercato per un asset. """
+        try:
+            symbol = asset_list.get_ticker(asset)
+            ticker = self.exchange.fetch_ticker(symbol)
+            return ticker['last']
+        except Exception as e:
+            self.logger.error(f"❌ Errore recupero prezzo {asset}: {e}")
+            return None
+
+    def get_open_positions_real(self):
+        """ Recupera posizioni e ordini con MATCH AGGRESSIVO e NORMALIZZAZIONE. """
+        try:
+            pos_res = self.exchange.private_post_openpositions()
+            positions = pos_res.get('result', {})
+            if not positions: return {}
+
+            orders_res = self.exchange.private_post_openorders()
+            open_orders = orders_res.get('result', {}).get('open', {})
+
+            for p_id, p_data in positions.items():
+                p_data['has_sl'] = False
+                p_data['has_tp'] = False
+                p_norm = self._normalize_ticker(p_data.get('pair', ''))
+
+                for o_id, o_data in open_orders.items():
+                    descr = o_data.get('descr', {})
+                    o_norm = self._normalize_ticker(descr.get('pair', ''))
+                    
+                    if o_norm == p_norm:
+                        tipo = str(descr.get('ordertype', '')).lower()
+                        if 'stop' in tipo: p_data['has_sl'] = True
+                        if 'profit' in tipo or 'limit' in tipo: p_data['has_tp'] = True
             
-            if not self._valida_parametri(symbol, None, size):
-                return False
+            return positions
+        except Exception as e:
+            self.logger.error(f"❌ Errore critico nel matching ordini: {e}")
+            return {}
 
-            # Recupero prezzo
-            try:
-                ticker = target_ex.fetch_ticker(symbol)
-                prezzo_entry = float(ticker['last'])
-            except Exception as e:
-                logging.error(f"Errore fetch prezzo per {symbol}: {e}")
-                return False
+    def _normalize_ticker(self, ticker):
+        if not ticker: return ""
+        t = str(ticker).upper().replace("/", "").replace(" ", "")
+        if "XBT" in t or "BTC" in t: return "BTC"
+        if "ETH" in t: return "ETH"
+        return t
 
-            # --- LOGICA DI INSTRADAMENTO (SIMULAZIONE VS LIVE) ---
-            if not self.live_mode or (is_f and self.force_futures_simulation):
-                self.posizioni_simulate[symbol] = {
-                    'entry': prezzo_entry,
-                    'size': size,
-                    'direzione': direzione,
+    def esegui_ordine(self, asset, direzione, size, leverage, voto, sl=None, tp=None, tipo_op="Swing"):
+        """
+        VERSIONE CHIMERA: Gestisce ingressi Market (Scalp) o Limit (Swing)
+        con arrotondamento prezzi basato su precisione asset reale.
+        """
+        try:
+            symbol = asset_list.get_ticker(asset)
+            tipo_ordine_side = 'buy' if direzione.upper() in ["BUY", "LONG"] else 'sell'
+            
+            # Se Scalp, entriamo a mercato per velocità. Se Swing, usiamo Limit (se prezzo disponibile)
+            tipo_esecuzione = 'market' if tipo_op == "Scalp" else 'market' # Default market per ora, estendibile
+
+            params = {
+                'leverage': str(leverage),
+                'trading_agreement': 'agree'
+            }
+
+            self.logger.info(f"🛒 ESECUZIONE {tipo_op} | {direzione} {asset} | Size: {size} | Voto: {voto}")
+            
+            # Esecuzione Ordine Principale
+            order = self.exchange.create_order(
+                symbol=symbol, 
+                type=tipo_esecuzione, 
+                side=tipo_ordine_side, 
+                amount=size, 
+                params=params
+            )
+
+            if order and ('id' in order or 'order_id' in order):
+                main_id = order.get('id') or order.get('order_id')
+                sl_id = None
+                tp_id = None
+                
+                # Piccola pausa per far digerire il margine a Kraken
+                time.sleep(2.0)
+                
+                # --- PROTEZIONE STOP LOSS ---
+                if sl and float(sl) > 0:
+                    self.logger.info(f"🛡️ Project Chimera: Inserimento SL a {sl}...")
+                    res_sl = self.gestisci_ordine_protezione(
+                        asset=asset, tipo_protezione='stop-loss', prezzo=sl,
+                        direzione_aperta=direzione.upper(), size_fallback=size, leverage=leverage
+                    )
+                    
+                    if res_sl and res_sl.get('success'):
+                        sl_id = res_sl.get('id')
+                        self.logger.info(f"✅ SL inserito: {sl_id}")
+                    else:
+                        errore_sl = res_sl.get('error', 'Errore sconosciuto')
+                        self.logger.critical(f"🚨 FALLIMENTO SL {asset}: {errore_sl}. EMERGENZA CHIUSURA!")
+                        # Panic Sell/Cover
+                        self.exchange.create_order(
+                            symbol=symbol, type='market', 
+                            side='sell' if direzione.upper() in ['BUY', 'LONG'] else 'buy', 
+                            amount=size, params={'leverage': str(leverage)}
+                        )
+                        return {'success': False, 'error': f'SL_FAILED: {errore_sl}'}
+
+                # --- PROTEZIONE TAKE PROFIT ---
+                if tp and float(tp) > 0:
+                    res_tp = self.gestisci_ordine_protezione(
+                        asset=asset, tipo_protezione='take-profit', prezzo=tp,
+                        direzione_aperta=direzione.upper(), size_fallback=size, leverage=leverage
+                    )
+                    if res_tp and res_tp.get('success'):
+                        tp_id = res_tp.get('id')
+                        self.logger.info(f"✅ TP inserito: {tp_id}")
+
+                # Memoria Persistente Chimera
+                self.ordini_attivi[asset] = {
+                    'order_id': main_id,
+                    'sl_id': sl_id,
+                    'tp_id': tp_id,
+                    'direzione': direzione.upper(),
                     'timestamp': time.time()
                 }
-                tag = "🧪 SIMULAZIONE MARGIN"
-                msg = (f"{tag}\n✅ APERTO {direzione}: {symbol}\nPrezzo: {prezzo_entry:.2f}\n"
-                       f"Size: {size:.4f}\nLeva: {self.leverage_value}x")
-                self._invia_notifica(msg)
-                return True
 
-            # --- MODALITA' LIVE (Corretto) ---
-            order_type = 'buy' if direzione == 'LONG' else 'sell'
-            params = {'leverage': self.leverage_value}
+                return {
+                    'success': True, 
+                    'order_id': main_id, 
+                    'sl_id': sl_id, 
+                    'tp_id': tp_id,
+                    'timestamp_apertura': time.time()
+                }
             
-            def _esecuzione():
-                # USARE target_ex per rispettare lo smistamento Spot/Futures
-                return target_ex.create_market_order(symbol, order_type, size, params)
+            return {'success': False, 'error': 'No order ID'}
+        except Exception as e:
+            self.logger.error(f"❌ Errore esecuzione Performer: {e}")
+            return {'success': False, 'error': str(e)}
             
-            ordine = self._retry_kraken(_esecuzione)
-            if ordine:
-                msg = (f"🚀 LIVE MARGIN ORDER EXECUTED\n✅ APERTO {direzione}: {symbol}\n"
-                       f"Prezzo: {prezzo_entry:.2f}\nLeva: {self.leverage_value}x\nID: {ordine.get('id')}")
-                self._invia_notifica(msg)
-                return True
-            return False
-
-        except Exception as e:
-            logging.error(f"❌ Errore critico apri_posizione_market: {e}")
-            traceback.print_exc()
-            return False
-
-    # ========================================================================
-    # CHIUSURA POSIZIONI
-    # ========================================================================
-    
-    def chiudi_posizione(self, symbol, motivo="Chiusura", modalita='SPOT', exchange=None):
-        """Chiude una posizione a margine invertendo l'ordine corrente."""
-        target_ex = exchange if exchange else self.exchange
+    def gestisci_ordine_protezione(self, asset, tipo_protezione, prezzo, direzione_aperta, size_fallback, leverage=1):
+        """ Crea ordini di Stop o Limit per proteggere la posizione """
         try:
-            is_f = self._is_future(symbol)
-            # ... (logica simulazione invariata) ...
+            symbol = asset_list.get_ticker(asset)
+            side_chiusura = "sell" if direzione_aperta.upper() in ["BUY", "LONG"] else "buy"
+            
+            # Formattazione chirurgica del prezzo
+            prezzo_fmt = self.qprice(symbol, prezzo)
+            volume_fmt = str(size_fallback) 
+            
+            params = {
+                'pair': symbol,
+                'type': side_chiusura,
+                'ordertype': tipo_protezione,
+                'price': prezzo_fmt,
+                'volume': volume_fmt,
+                'reduce_only': True,
+                'trading_agreement': 'agree'
+            }
 
-            # --- MODALITA' LIVE MARGIN ---
-            try:
-                # Usa target_ex invece di self.exchange
-                posizioni = target_ex.fetch_positions([symbol])
-                if not posizioni:
-                    logging.warning(f"Nessuna posizione reale trovata per {symbol} su {modalita}")
-                    return False
-                
-                pos = posizioni[0]
-                side = 'sell' if pos['side'] == 'long' else 'buy'
-                size = pos['contracts'] if is_f else pos['amount']
-                
-                params = {'leverage': self.leverage_value}
-                ordine = target_ex.create_market_order(symbol, side, size, params)
-                
-                msg = f"📉 LIVE {modalita} CLOSED\nAsset: {symbol}\nMotivo: {motivo}"
-                self._invia_notifica(msg)
-                return True
-            except Exception as e:
-                logging.error(f"Errore chiusura reale Kraken Margin: {e}")
-                return False
-
+            if leverage and float(leverage) > 1:
+                params['leverage'] = str(leverage)
+            
+            res = self.exchange.private_post_addorder(params)
+            
+            if res and 'result' in res and 'txid' in res['result']:
+                return {'success': True, 'id': res['result']['txid'][0]}
+            
+            return {'success': False, 'error': str(res.get('error'))}
         except Exception as e:
-            logging.error(f"Errore chiudi_posizione: {e}")
-            return False
+            return {'success': False, 'error': str(e)}
 
-    def aggiorna_ordine_sl(self, symbol, nuovo_sl, modalita='SPOT'):
-        """Aggiorna lo Stop Loss includendo la modalità (Spot/Futures)"""
-        if isinstance(nuovo_sl, tuple): nuovo_sl = nuovo_sl[0]
-        # Includiamo la modalità nel messaggio per chiarezza su Telegram
-        msg = f"🛡️ SL AGGIORNATO ({modalita})\nAsset: {symbol}\nNuovo SL: {nuovo_sl:.2f}"
-        self._invia_notifica(msg)
-        return True
-
-    def rimuovi_tp(self, symbol, modalita='SPOT'):
-        """Attiva la Moon Phase rimuovendo il TP per la modalità specifica"""
-        msg = f"🌙 MOON PHASE ACTIVATED ({modalita})\nAsset: {symbol}\nTP Rimosso."
-        self._invia_notifica(msg)
-        return True
-
-    def get_stato_posizioni(self):
+    def pulizia_totale_ordini(self, asset):
+        """ Rimuove ogni ordine orfano per l'asset specificato """
         try:
-            if not self.live_mode: return self.posizioni_simulate
-            posizioni = self.exchange.fetch_positions()
-            return {p['symbol']: p for p in posizioni if float(p.get('amount', 0)) > 0}
+            symbol = asset_list.get_ticker(asset)
+            self.logger.info(f"🧹 Pulizia orfani per {asset}...")
+            
+            ordini_aperti = self.exchange.fetch_open_orders(symbol)
+            if not ordini_aperti:
+                return True
+
+            count_cancellati = 0
+            for ordine in ordini_aperti:
+                order_id = ordine.get('id')
+                if order_id:
+                    if self.cancella_ordine_specifico(order_id):
+                        count_cancellati += 1
+            
+            self.logger.info(f"✨ Pulizia completata: {count_cancellati} ordini rimossi.")
+            return True
         except Exception as e:
-            logging.error(f"Errore fetch stato: {e}")
-            return {}
+            self.logger.error(f"🔴 Errore pulizia orfani: {e}")
+            return False
